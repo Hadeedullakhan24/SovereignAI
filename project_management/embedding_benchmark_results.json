@@ -1,0 +1,54 @@
+{
+  "status": "SUCCESS",
+  "model_name": "BAAI/bge-small-en-v1.5",
+  "embedding_dimension": 384,
+  "device": "cpu",
+  "total_documents_processed": 6,
+  "total_chunks_embedded": 135,
+  "cold_cache_duration_sec": 170.99,
+  "cold_throughput_chunks_per_sec": 0.79,
+  "cold_avg_latency_ms": 1266.61,
+  "warm_cache_duration_sec": 0.1294,
+  "warm_throughput_chunks_per_sec": 1043.44,
+  "cache_reuse_percentage": 50.0,
+  "cache_speedup": 1321.6,
+  "model_load_time_sec": 13.01,
+  "document_breakdown": [
+    {
+      "category": "manuals",
+      "file_name": "Emerson_Control_Valve_Handbook.pdf",
+      "chunks_count": 30,
+      "prep_time_sec": 14.81
+    },
+    {
+      "category": "manuals",
+      "file_name": "fisher_control_valve_handbook.pdf",
+      "chunks_count": 30,
+      "prep_time_sec": 1.17
+    },
+    {
+      "category": "safety_docs",
+      "file_name": "OISD-STD-105.pdf",
+      "chunks_count": 30,
+      "prep_time_sec": 0.89
+    },
+    {
+      "category": "safety_docs",
+      "file_name": "OISD-STD-116.pdf",
+      "chunks_count": 30,
+      "prep_time_sec": 1.59
+    },
+    {
+      "category": "inspection_reports",
+      "file_name": "boiler_inspection_003.md",
+      "chunks_count": 5,
+      "prep_time_sec": 0.05
+    },
+    {
+      "category": "inspection_reports",
+      "file_name": "centrifugal_pump_inspection_005.md",
+      "chunks_count": 10,
+      "prep_time_sec": 0.06
+    }
+  ]
+}

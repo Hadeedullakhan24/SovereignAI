@@ -1,0 +1,50 @@
+{
+  "timestamp": "2026-09-10T22:46:13",
+  "milestone": "milestone_09",
+  "system": "MRPL Sovereign Generation Engine",
+  "model_load_latency_ms": 0.006,
+  "micro_benchmarks": {
+    "prompt_build_latency_ms": 0.181,
+    "context_window_assembly_ms": 0.124,
+    "citation_validation_ms": 0.224,
+    "hallucination_guard_ms": 0.23,
+    "streaming_overhead_ms": 1.597,
+    "sqlite_memory_turn_ms": 0.184
+  },
+  "token_metrics": {
+    "prompt_characters": 3260,
+    "prompt_tokens": 815,
+    "retrieved_context_tokens": 508,
+    "generated_tokens": 33,
+    "token_emission_throughput_tps": 20670.2
+  },
+  "pipeline_benchmarks": {
+    "scale_50": {
+      "requests": 50,
+      "throughput_qps": 355.11,
+      "mean_latency_ms": 2.81,
+      "p50_latency_ms": 2.67,
+      "p95_latency_ms": 4.15,
+      "p99_latency_ms": 4.36
+    },
+    "scale_100": {
+      "requests": 100,
+      "throughput_qps": 341.52,
+      "mean_latency_ms": 2.93,
+      "p50_latency_ms": 2.76,
+      "p95_latency_ms": 4.57,
+      "p99_latency_ms": 6.77
+    },
+    "scale_250": {
+      "requests": 250,
+      "throughput_qps": 354.04,
+      "mean_latency_ms": 2.82,
+      "p50_latency_ms": 2.68,
+      "p95_latency_ms": 3.88,
+      "p99_latency_ms": 5.57
+    }
+  },
+  "resource_metrics": {
+    "process_rss_memory_mb": 88.68
+  }
+}

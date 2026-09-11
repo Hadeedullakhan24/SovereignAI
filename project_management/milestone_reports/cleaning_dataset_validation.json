@@ -1,0 +1,184 @@
+[
+  {
+    "category": "manuals",
+    "file_name": "Emerson_Control_Valve_Handbook.pdf",
+    "status": "CLEANED",
+    "chars_before": 1585703,
+    "chars_after": 1585060,
+    "reduction_pct": 0.04,
+    "protected_tokens_count": 90,
+    "sample_protected_tokens": [
+      "-4 bar",
+      "1.7 bar",
+      "10.3 bar",
+      "103 bar"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 6090.049
+  },
+  {
+    "category": "manuals",
+    "file_name": "fisher_control_valve_handbook.pdf",
+    "status": "CLEANED",
+    "chars_before": 116051,
+    "chars_after": 116004,
+    "reduction_pct": 0.04,
+    "protected_tokens_count": 25,
+    "sample_protected_tokens": [
+      "2 bar",
+      "29 psi",
+      "3 bar",
+      "4 bar"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 378.054
+  },
+  {
+    "category": "manuals",
+    "file_name": "fisher_ic2_control_valve_handbook.pdf",
+    "status": "CLEANED",
+    "chars_before": 61611,
+    "chars_after": 61598,
+    "reduction_pct": 0.02,
+    "protected_tokens_count": 12,
+    "sample_protected_tokens": [
+      "ASME B16.11",
+      "ASME B16.25",
+      "ASME B16.34",
+      "Linear"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 190.485
+  },
+  {
+    "category": "safety_docs",
+    "file_name": "OISD-STD-105.pdf",
+    "status": "CLEANED",
+    "chars_before": 112612,
+    "chars_after": 112564,
+    "reduction_pct": 0.04,
+    "protected_tokens_count": 3,
+    "sample_protected_tokens": [
+      "Revisio",
+      "Revision en-US",
+      "rev d"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 413.779
+  },
+  {
+    "category": "safety_docs",
+    "file_name": "OISD-STD-116.pdf",
+    "status": "CLEANED",
+    "chars_before": 197133,
+    "chars_after": 197018,
+    "reduction_pct": 0.06,
+    "protected_tokens_count": 5,
+    "sample_protected_tokens": [
+      "API 00",
+      "OISD 14",
+      "REV IAT",
+      "Revise"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 705.934
+  },
+  {
+    "category": "safety_docs",
+    "file_name": "OISD-STD-117.pdf",
+    "status": "CLEANED",
+    "chars_before": 143743,
+    "chars_after": 143569,
+    "reduction_pct": 0.12,
+    "protected_tokens_count": 5,
+    "sample_protected_tokens": [
+      "LINE LU",
+      "LINE TA",
+      "Rev ised",
+      "Rev isi"
+    ],
+    "headers_removed": 1,
+    "footers_removed": 1,
+    "mapped_pages": 1,
+    "exec_time_ms": 529.904
+  },
+  {
+    "category": "inspection_reports",
+    "file_name": "boiler_inspection_003.md",
+    "status": "CLEANED",
+    "chars_before": 657,
+    "chars_after": 657,
+    "reduction_pct": 0.0,
+    "protected_tokens_count": 2,
+    "sample_protected_tokens": [
+      "B-101",
+      "BLR-0045"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 4.847
+  },
+  {
+    "category": "inspection_reports",
+    "file_name": "centrifugal_pump_inspection_005.md",
+    "status": "CLEANED",
+    "chars_before": 2230,
+    "chars_after": 2230,
+    "reduction_pct": 0.0,
+    "protected_tokens_count": 6,
+    "sample_protected_tokens": [
+      "118 m\u00b3/h",
+      "71 \u00b0C",
+      "84 \u00b0C",
+      "P-005"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 25.487
+  },
+  {
+    "category": "inspection_reports",
+    "file_name": "compressor_inspection_006.md",
+    "status": "CLEANED",
+    "chars_before": 2440,
+    "chars_after": 2440,
+    "reduction_pct": 0.0,
+    "protected_tokens_count": 10,
+    "sample_protected_tokens": [
+      "0.52 bar",
+      "0.67 bar",
+      "0.86 bar",
+      "31 \u00b0C"
+    ],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 29.619
+  },
+  {
+    "category": "maintenance",
+    "file_name": "ai4i2020_maintenance_analysis_10000.csv",
+    "status": "CLEANED",
+    "chars_before": 2238120,
+    "chars_after": 2238120,
+    "reduction_pct": 0.0,
+    "protected_tokens_count": 0,
+    "sample_protected_tokens": [],
+    "headers_removed": 0,
+    "footers_removed": 0,
+    "mapped_pages": 1,
+    "exec_time_ms": 13711.817
+  }
+]
