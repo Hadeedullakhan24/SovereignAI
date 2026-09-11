@@ -1,0 +1,28 @@
+# ============================================================================
+# RAG Engine — Dependencies
+# Sovereign On-Premise Agentic AI Workbench (SIH26117 / MRPL)
+# Member 1: Knowledge Base / RAG Engine
+# ============================================================================
+
+# --- Core ---
+pydantic>=2.0,<3.0
+pyyaml>=6.0,<7.0
+
+# --- Document Loaders ---
+pypdf>=3.0,<5.0
+python-docx>=0.8,<2.0
+pandas>=2.0,<3.0
+Pillow>=10.0,<12.0
+
+# --- Embedding Models ---
+sentence-transformers>=2.2,<4.0
+
+# --- Vector Stores ---
+chromadb>=0.4,<1.0
+
+# --- Dev / Testing ---
+pytest>=7.0,<9.0
+black>=23.0
+isort>=5.12
+ruff>=0.1
+mypy>=1.0

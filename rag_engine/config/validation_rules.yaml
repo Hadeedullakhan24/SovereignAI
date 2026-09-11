@@ -1,0 +1,71 @@
+# Sovereign On-Premise Agentic AI Workbench (SIH26117 / MRPL)
+# Dataset Validation Engine — Configuration Rules
+# Offline-first, air-gapped validation constraints
+
+dataset:
+  root_path: "datasets"
+  supported_extensions:
+    - ".pdf"
+    - ".docx"
+    - ".pptx"
+    - ".xlsx"
+    - ".csv"
+    - ".txt"
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".json"
+    - ".xml"
+    - ".md"
+  ignored_extensions:
+    - ".pyc"
+    - ".gitkeep"
+    - ".gitignore"
+    - ".swp"
+    - ".ds_store"
+  ignored_directories:
+    - ".git"
+    - "__pycache__"
+    - ".venv"
+    - "node_modules"
+    - ".idea"
+    - ".vscode"
+
+validation:
+  max_file_size_mb: 500
+  min_file_size_bytes: 1
+  enable_deep_integrity_check: true
+  hash_algorithm: "sha256"
+  hash_chunk_size_bytes: 65536
+
+categories:
+  manuals:
+    doc_type: "technical_manual"
+  safety_docs:
+    doc_type: "safety_regulation"
+  maintenance:
+    doc_type: "maintenance_record"
+  inspection_reports:
+    doc_type: "inspection_report"
+  engineering_drawings:
+    doc_type: "engineering_drawing"
+  ocr:
+    doc_type: "scanned_document"
+  pidqa:
+    doc_type: "process_instrumentation"
+  templates:
+    doc_type: "template"
+  emails:
+    doc_type: "correspondence"
+  coding:
+    doc_type: "source_code"
+  handwritten_notes:
+    doc_type: "handwritten_document"
+  Vision:
+    doc_type: "visual_asset"
+
+reporting:
+  output_dir: "outputs"
+  manifest_filename: "manifest.json"
+  statistics_filename: "dataset_statistics.json"
+  health_report_filename: "dataset_health_report.md"

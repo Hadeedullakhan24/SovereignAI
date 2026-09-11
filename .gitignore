@@ -1,0 +1,142 @@
+# ============================================================
+# Python & Bytecode
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*$py.class
+
+# Test / Lint / Type checking caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ============================================================
+# Virtual Environments
+# ============================================================
+myenv/
+/myenv/
+venv/
+/venv/
+.venv/
+/.venv/
+env/
+/env/
+ENV/
+/ENV/
+
+# ============================================================
+# Local AI Model Weights
+# ============================================================
+models/
+/models/
+*.safetensors
+*.bin
+*.onnx
+*.gguf
+*.pt
+*.pth
+*.ckpt
+
+# ============================================================
+# Vector Database Persistence
+# ============================================================
+vector_db/
+/vector_db/
+data/vector_db/
+/data/vector_db/
+data/
+/data/
+*.sqlite
+*.sqlite3
+*.db
+*.wal
+*.lock
+
+# ============================================================
+# Runtime Caches & Inverted Indexes
+# ============================================================
+cache/
+/cache/
+.cache/
+/.cache/
+bm25_index.json
+retrieval_query_cache.db
+
+# ============================================================
+# Generated Outputs & Logs
+# ============================================================
+outputs/
+/outputs/
+logs/
+/logs/
+*.log
+
+# ============================================================
+# Raw Datasets (Exclude heavy assets and generated manifests)
+# ============================================================
+datasets/Vision/
+/datasets/Vision/
+datasets/vision/
+/datasets/vision/
+datasets/coding/
+/datasets/coding/
+datasets/ocr/
+/datasets/ocr/
+datasets/handwritten_notes/
+/datasets/handwritten_notes/
+datasets/engineering_drawings/
+/datasets/engineering_drawings/
+datasets/manuals/
+/datasets/manuals/
+datasets/maintenance/
+/datasets/maintenance/
+datasets/pidqa/
+/datasets/pidqa/
+datasets/emails/
+/datasets/emails/
+datasets/safety_docs/
+/datasets/safety_docs/
+datasets/templates/
+/datasets/templates/
+datasets/manifest.json
+/datasets/manifest.json
+datasets/dataset_statistics.json
+/datasets/dataset_statistics.json
+
+# Keep lightweight test fixtures
+!datasets/inspection_reports/
+!datasets/inspection_reports/**
+!/datasets/inspection_reports/
+!/datasets/inspection_reports/**
+
+# Legacy root folders
+loaders/
+/loaders/
+
+# ============================================================
+# Secrets & Credentials
+# ============================================================
+.env
+.env.*
+!.env.example
+secrets/
+/secrets/
+credentials/
+/credentials/
+*.pem
+*.key
+credentials.json
+
+# ============================================================
+# IDE & Operating System Files
+# ============================================================
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
