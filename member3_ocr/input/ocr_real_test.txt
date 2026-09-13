@@ -1,0 +1,4 @@
+MRPL OCR TEST
+Equipment: Pump P-101
+Pressure: 12.5 bar
+Status: APPROVED
