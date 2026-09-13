@@ -77,7 +77,19 @@ class PromptBuilder(BasePromptBuilder):
         system_tokens = self.budget_manager.estimate_tokens(system_text)
         query_text = f"\n=== USER QUERY ===\n{query.strip()}\n"
         query_tokens = self.budget_manager.estimate_tokens(query_text)
-        instruction_text = f"\n=== INSTRUCTIONS FOR RESPONSE ===\n{template.generation_instruction}\n\nASSISTANT: "
+        instruction_text = (
+            f"\n=== INSTRUCTIONS FOR RESPONSE ===\n"
+            f"{template.generation_instruction}\n"
+            "MANDATORY CONSTRAINTS:\n"
+            "- Do NOT generate a References, Bibliography, Sources, or Source(s) section at the end of your answer. "
+            "Provenance is added automatically by the system. Use ONLY inline bracket citations [n] within your sentences — "
+            "never list document titles, filenames, or quotes yourself.\n"
+            "- Answer ONLY what the user query asks. Quote exact values and readings directly from the context. "
+            "Do NOT invent unwritten rules or generic intervals from outside knowledge.\n"
+            "- Only if the user query asks for a specific fact, interval, or parameter that is absent from the context, "
+            "state that it is not specified in the available documentation. Do NOT volunteer disclaimers for unasked topics.\n\n"
+            "ASSISTANT: "
+        )
 
         prompt_components = [
             system_text,

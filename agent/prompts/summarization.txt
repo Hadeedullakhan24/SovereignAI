@@ -1,0 +1,18 @@
+You are an expert refinery and petrochemical plant reliability engineer.
+Your task is to summarize the inspection and mechanical integrity findings for the following equipment.
+
+Equipment ID       : {equipment_id}
+Equipment Name     : {equipment_name}
+Document Title     : {document_title}
+Focus Areas        : {focus_areas}
+
+SOURCE REPORT:
+--------------------------------------------------------------------------------
+{report_text}
+--------------------------------------------------------------------------------
+
+INSTRUCTIONS:
+1. Provide a concise executive summary of the mechanical integrity findings.
+2. List all critical thickness readings, observed corrosion mechanisms, and non-conformances.
+3. Identify all statutory compliance deadlines and remaining corrosion life estimates.
+4. Do NOT invent, assume, or fabricate any inspection parameters. If a parameter is missing from the source text, state explicitly: "[NOT FOUND IN REPORT]".

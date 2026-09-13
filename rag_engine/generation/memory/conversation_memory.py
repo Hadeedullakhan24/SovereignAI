@@ -15,6 +15,7 @@ from pathlib import Path
 import sqlite3
 import threading
 from typing import Any, Dict, List, Optional
+from rag_engine.config.runtime_paths import runtime_file
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class ConversationMemory:
         db_path: Path | str | None = None,
     ) -> None:
         self.max_turns = max_turns_per_session
-        self.db_path = Path(db_path) if db_path else Path("rag_engine/cache/conversation_memory.db")
+        self.db_path = Path(db_path) if db_path else runtime_file("cache", "conversation_memory.db")
         self._lock = threading.RLock()
         self._local = threading.local()
         self._init_db()

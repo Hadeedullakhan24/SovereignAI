@@ -243,9 +243,15 @@ class GenerationPipeline:
 
         # 6. Citation Validation & Phantom Pruning
         start_guard = time.perf_counter()
+        valid_sources = [
+            c.document_id for c in retrieval_result.citations if getattr(c, "document_id", None)
+        ] + [
+            getattr(c, "document_name", "") for c in retrieval_result.citations if getattr(c, "document_name", None)
+        ]
         cit_report = self.citation_validator.validate(
             generated_text=gen_output.text,
             valid_anchors=prompt_payload.chunk_to_anchor_map,
+            valid_sources=valid_sources,
         )
 
         # 7. Hallucination Guard Cross-Verification
@@ -269,8 +275,9 @@ class GenerationPipeline:
         guard_ms = (time.perf_counter() - start_guard) * 1000.0
 
         # 9. Format Response with Provenance References
+        clean_ans = ground_report.cleaned_text or cit_report.cleaned_text
         final_answer = ResponseFormatter.format_with_provenance(
-            answer_text=cit_report.cleaned_text,
+            answer_text=clean_ans,
             citations=retrieval_result.citations,
         )
 

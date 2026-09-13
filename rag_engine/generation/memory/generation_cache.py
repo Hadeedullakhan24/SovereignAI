@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Dict, Generator, Optional, Sequence
+from rag_engine.config.runtime_paths import runtime_file
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,10 @@ class GenerationCache:
 
     def __init__(
         self,
-        db_path: Path | str = "rag_engine/cache/generation_cache.db",
+        db_path: Path | str | None = None,
         default_ttl_seconds: int = 604800,  # 7 days
     ) -> None:
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path) if db_path is not None else runtime_file("cache", "generation_cache.db")
         self.default_ttl = default_ttl_seconds
         self._lock = threading.Lock()
         self._init_db()

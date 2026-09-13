@@ -6,6 +6,7 @@ with seamless future dispatch to networked Qdrant Server / Cluster.
 
 from __future__ import annotations
 
+import atexit
 import logging
 from pathlib import Path
 import shutil
@@ -84,7 +85,7 @@ class QdrantVectorStore(BaseVectorStore):
                 self.client = QdrantClient(
                     url=self.config.url,
                     api_key=self.config.api_key,
-                    timeout=self.config.timeout_seconds,
+                    timeout=int(self.config.timeout_seconds) if self.config.timeout_seconds is not None else None,
                 )
             else:
                 storage_path_str = str(self.config.storage_path)
@@ -94,6 +95,10 @@ class QdrantVectorStore(BaseVectorStore):
                 self.client = QdrantClient(path=storage_path_str)
 
             self._is_initialized = True
+            try:
+                atexit.register(self.close)
+            except Exception:
+                pass
 
     def close(self) -> None:
         """Release client connection and close file handles."""
@@ -105,6 +110,10 @@ class QdrantVectorStore(BaseVectorStore):
                     logger.warning("Error closing Qdrant client: %s", e)
                 self.client = None
             self._is_initialized = False
+            try:
+                atexit.unregister(self.close)
+            except Exception:
+                pass
 
     def _ensure_client(self) -> QdrantClient:
         if not self._is_initialized or self.client is None:
@@ -182,7 +191,7 @@ class QdrantVectorStore(BaseVectorStore):
         client = self._ensure_client()
         with self._lock:
             try:
-                return bool(client.collection_exists(collection_name=name))
+                return client.collection_exists(collection_name=name)
             except Exception as e:
                 logger.error("Error checking collection existence '%s': %s", name, e)
                 return False
@@ -194,7 +203,17 @@ class QdrantVectorStore(BaseVectorStore):
             if not self.collection_exists(name):
                 raise CollectionNotFoundError(f"Collection '{name}' does not exist.")
             try:
-                return bool(client.delete_collection(collection_name=name))
+                res = client.delete_collection(collection_name=name)
+                # Safeguard for embedded local mode on Windows:
+                # QdrantLocal.delete_collection uses shutil.rmtree(..., ignore_errors=True)
+                # which silently fails on Windows if SQLite handles linger.
+                if not self.config.url and str(self.config.storage_path) != ":memory:":
+                    col_dir = Path(self.config.storage_path) / "collection" / name
+                    if col_dir.exists():
+                        import gc
+                        gc.collect()
+                        shutil.rmtree(col_dir, ignore_errors=True)
+                return res
             except Exception as e:
                 raise VectorStoreError(f"Failed to delete collection '{name}': {e}") from e
 
@@ -376,7 +395,20 @@ class QdrantVectorStore(BaseVectorStore):
             pt = records[0]
             payload = pt.payload or {}
             metadata = MetadataSerializer.to_metadata(payload)
-            vec = pt.vector if isinstance(pt.vector, list) else []
+
+            raw_vec: Any = pt.vector
+            vec: list[float] = []
+            if isinstance(raw_vec, list):
+                if raw_vec and isinstance(raw_vec[0], list):
+                    inner = raw_vec[0]
+                    vec = [float(x) for x in inner if isinstance(x, (int, float))]
+                else:
+                    vec = [float(x) for x in raw_vec if isinstance(x, (int, float))]
+            elif isinstance(raw_vec, dict):
+                for v in raw_vec.values():
+                    if isinstance(v, list):
+                        vec = [float(x) for x in v if isinstance(x, (int, float))]
+                        break
 
             return EmbeddedChunk(
                 chunk_id=payload.get("chunk_id", chunk_id),

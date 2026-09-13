@@ -17,6 +17,7 @@ from typing import Generator, Optional
 
 from rag_engine.retrieval.base_retriever import RetrievalResult
 from rag_engine.retrieval.retrieval_exceptions import QueryCacheError
+from rag_engine.config.runtime_paths import runtime_file
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,11 @@ class QueryCache:
 
     def __init__(
         self,
-        db_path: str | Path = "cache/retrieval_query_cache.db",
+        db_path: str | Path | None = None,
         default_ttl_seconds: int = 86400,  # 24 hours
         enabled: bool = True,
     ) -> None:
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path) if db_path is not None else runtime_file("cache", "retrieval_query_cache.db")
         self.default_ttl = default_ttl_seconds
         self.enabled = enabled
         self._lock = threading.RLock()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import uuid
 from typing import Optional
@@ -147,7 +148,7 @@ class CSVParser(BaseParser):
         )
 
         return ParsedDocument(
-            document_id=f"parsed_{uuid.uuid4().hex[:12]}",
+            document_id=f"parsed_{hashlib.sha256(document.doc_id.encode('utf-8')).hexdigest()[:12]}",
             raw_document_id=document.doc_id,
             title=title,
             category=parsed_meta.category,

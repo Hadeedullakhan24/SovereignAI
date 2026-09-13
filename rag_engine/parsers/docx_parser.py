@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
@@ -118,7 +119,7 @@ class DOCXParser(BaseParser):
         )
 
         return ParsedDocument(
-            document_id=f"parsed_{uuid.uuid4().hex[:12]}",
+            document_id=f"parsed_{hashlib.sha256(document.doc_id.encode('utf-8')).hexdigest()[:12]}",
             raw_document_id=document.doc_id,
             title=title,
             category=parsed_meta.category,

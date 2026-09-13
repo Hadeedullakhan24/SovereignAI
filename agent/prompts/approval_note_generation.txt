@@ -1,0 +1,12 @@
+TECHNICAL CONTINUED SERVICE APPROVAL NOTE
+Equipment ID: {equipment_id} ({equipment_name}) | Report Ref: {report_no}
+Inspector: {inspector}
+
+1. Structural Assessment (data-derived):
+   - {shell_assessment}
+   - {pressure_assessment}.
+2. Regulatory SOP Framework:
+   - Evaluated under API 510 In-Service Pressure Vessel Inspection Code & OISD-130.
+3. Inspector Recommendation (from report):
+   - {recommendation}
+{default_disclosure}

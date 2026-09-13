@@ -52,6 +52,24 @@ from rag_engine.vector_store.vector_registry import VectorRegistry
 from rag_engine.vector_store.vector_repository import VectorRepository
 
 
+def test_default_runtime_store_persists_and_reopens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Default embedded storage is writable, persistent, and never uses repo data."""
+    monkeypatch.setenv("SOVEREIGNAI_RUNTIME_DIR", str(tmp_path / "runtime"))
+    config = VectorStoreConfig()
+    first = QdrantVectorStore(config=config)
+    first.create_collection(CollectionConfig(name="runtime_persistence", vector_size=4))
+    first.upsert_chunks("runtime_persistence", [_make_sample_chunk("runtime_chunk")])
+    first.close()
+
+    reopened = QdrantVectorStore(config=VectorStoreConfig())
+    try:
+        found = reopened.search_vectors("runtime_persistence", [0.1, 0.2, 0.3, 0.4], limit=1)
+        assert len(found) == 1
+        assert found[0].chunk_id == "runtime_chunk"
+    finally:
+        reopened.close()
+
+
 @pytest.fixture
 def temp_store(tmp_path: Path) -> QdrantVectorStore:
     """Fixture providing an isolated local filesystem Qdrant store."""

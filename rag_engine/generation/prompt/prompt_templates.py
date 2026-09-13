@@ -64,10 +64,15 @@ _SYSTEM_PREAMBLE = (
     "Your objective is to provide precise, technically accurate, and strictly evidence-grounded answers.\n"
     "CRITICAL RULES:\n"
     "1. Answer solely using the verified documentation provided in the CONTEXT section.\n"
-    "2. If the answer cannot be determined strictly from the context, state: 'Based on available refinery documentation, this information is not specified.'\n"
-    "3. Every assertion containing technical parameters, limits, or procedures MUST cite its source using bracketed numbers like [1] or [2].\n"
-    "4. Do NOT hallucinate equipment tags, operating limits, or standards.\n"
-    "5. Maintain refinery engineering rigor at all times."
+    "2. Answer ONLY what the user's question explicitly asks. Do NOT proactively volunteer disclaimers or mention unrelated topics that were not requested.\n"
+    "3. STRICT GROUNDING: Quote exact figures, readings, and dates directly from the context. "
+    "Do NOT extrapolate generic rules, percentages, or intervals from outside knowledge. "
+    "If a specific parameter, interval, or requirement requested by the user's question is NOT found in the context, state that this specific information is not specified in the available documentation.\n"
+    "4. Every assertion containing technical parameters, dates, limits, or procedures MUST cite its source using bracketed numbers like [1] or [2].\n"
+    "5. NO BIBLIOGRAPHY / NO REFERENCE SECTION: Do NOT generate a References, Bibliography, or Sources section at the end of your answer. "
+    "Provenance is added automatically by the system. Use ONLY inline bracket citations [n] within your sentences — never list document titles, filenames, or quotes yourself.\n"
+    "6. Do NOT hallucinate equipment tags, operating limits, numbers, or standards.\n"
+    "7. Maintain refinery engineering rigor at all times."
 )
 
 TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
@@ -124,7 +129,10 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
             "Structure your answer with:\n"
             "1. Governing standard citations (e.g. OISD-105, OISD-116) [n].\n"
             "2. Mandatory safety precautions, PPE, and isolation boundaries.\n"
-            "3. Hazard mitigation protocols and emergency actions."
+            "3. Hazard mitigation protocols and emergency actions.\n"
+            "If any requested statutory interval, thickness, or limit is not explicitly documented in the context, "
+            "state that it is not specified in the available documentation. "
+            "Do NOT append a References or Bibliography section."
         ),
     ),
     PromptArchetype.TROUBLESHOOTING: PromptTemplate(
@@ -158,8 +166,12 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         archetype=PromptArchetype.GENERAL_QA,
         system_instruction=_SYSTEM_PREAMBLE,
         generation_instruction=(
-            "Provide a concise, direct answer based strictly on the verified context, "
-            "citing all source statements with [n]."
+            "Provide a concise, direct answer addressing only what was asked in the user query, based strictly on the verified context, "
+            "citing source statements with [n]. Quote exact readings, dates, and limits directly from the context. "
+            "If the user query asks about a specific parameter, interval, or requirement that is not documented in the context, "
+            "explicitly state that this specific information is not specified in the available documentation. "
+            "Do NOT volunteer disclaimers about topics not asked for. "
+            "Do NOT append a References, Bibliography, or Sources section."
         ),
     ),
 }

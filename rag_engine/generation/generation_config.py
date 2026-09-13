@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+from rag_engine.config.runtime_paths import runtime_file
 
 
 class TokenBudgetConfig(BaseModel):
@@ -63,7 +64,7 @@ class ModelInferenceConfig(BaseModel):
         description="Top-k sampling threshold; 0 disables top-k",
     )
     max_new_tokens: int = Field(
-        default=128,
+        default=400,
         ge=1,
         le=4096,
         description="Upper bound on generated tokens",
@@ -148,7 +149,7 @@ class GenerationConfig(BaseModel):
         description="Enable persistent SQLite generation cache",
     )
     cache_db_path: Path = Field(
-        default=Path("rag_engine/cache/generation_cache.db"),
+        default_factory=lambda: runtime_file("cache", "generation_cache.db"),
         description="Path to SQLite WAL generation cache database",
     )
     cache_ttl_seconds: int = Field(
