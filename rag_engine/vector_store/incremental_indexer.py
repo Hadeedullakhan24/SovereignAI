@@ -34,22 +34,73 @@ class IncrementalIndexer:
             new_ids = [c.chunk_id for c in incoming_chunks]
             return DiffPlan(new_chunk_ids=new_ids)
 
+        # Fast path: If collection is completely empty, all chunks are new
+        try:
+            stats = self.store.get_collection_stats(collection_name)
+            if stats.points_count == 0:
+                return DiffPlan(new_chunk_ids=[c.chunk_id for c in incoming_chunks])
+        except Exception:
+            pass
+
         new_ids: list[str] = []
         modified_ids: list[str] = []
         unchanged_ids: list[str] = []
 
-        # Check existing chunks individually
         incoming_map = {c.chunk_id: c for c in incoming_chunks}
-        for chunk_id, chunk in incoming_map.items():
-            existing = self.store.get_chunk(collection_name, chunk_id)
-            if existing is None:
-                new_ids.append(chunk_id)
-            else:
-                # Compare content hash
-                if existing.chunk_hash == chunk.chunk_hash:
-                    unchanged_ids.append(chunk_id)
+
+        # Fast batch retrieval optimization when supported by underlying client
+        batch_processed = False
+        if hasattr(self.store, "_ensure_client"):
+            try:
+                from rag_engine.vector_store.vector_utils import chunk_id_to_uuid
+                client = self.store._ensure_client()
+                uuid_to_chunk_id = {chunk_id_to_uuid(cid): cid for cid in incoming_map}
+                uuid_keys = list(uuid_to_chunk_id.keys())
+                batch_size = 500
+                found_hashes: dict[str, str] = {}
+                for i in range(0, len(uuid_keys), batch_size):
+                    sub_uuids = uuid_keys[i : i + batch_size]
+                    records = client.retrieve(
+                        collection_name=collection_name,
+                        ids=sub_uuids,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    for rec in records:
+                        orig_cid = uuid_to_chunk_id.get(str(rec.id))
+                        if orig_cid:
+                            p = rec.payload or {}
+                            chash = p.get("chunk_hash") or p.get("sha256") or ""
+                            found_hashes[orig_cid] = chash
+
+                for chunk_id, chunk in incoming_map.items():
+                    if chunk_id not in found_hashes:
+                        new_ids.append(chunk_id)
+                    else:
+                        if found_hashes[chunk_id] == chunk.chunk_hash:
+                            unchanged_ids.append(chunk_id)
+                        else:
+                            modified_ids.append(chunk_id)
+                batch_processed = True
+            except Exception as e:
+                logger.warning("Batch reconciliation diff failed, falling back to sequential: %s", e)
+                new_ids.clear()
+                modified_ids.clear()
+                unchanged_ids.clear()
+                batch_processed = False
+
+        if not batch_processed:
+            # Check existing chunks individually (fallback)
+            for chunk_id, chunk in incoming_map.items():
+                existing = self.store.get_chunk(collection_name, chunk_id)
+                if existing is None:
+                    new_ids.append(chunk_id)
                 else:
-                    modified_ids.append(chunk_id)
+                    # Compare content hash
+                    if existing.chunk_hash == chunk.chunk_hash:
+                        unchanged_ids.append(chunk_id)
+                    else:
+                        modified_ids.append(chunk_id)
 
         # Detect deleted chunks for the document if document_id provided
         deleted_ids: list[str] = []

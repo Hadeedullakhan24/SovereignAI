@@ -94,19 +94,29 @@ def run_ingestion(
         "safety_docs",
         "manuals",
         "templates",
+        "emails",
+        "maintenance",
     ]
 
     discovered_files: list[tuple[str, Path]] = []
-    supported_extensions = {".pdf", ".md", ".txt", ".docx", ".csv"}
+    supported_extensions = {".pdf", ".md", ".txt", ".docx", ".csv", ".xlsx"}
 
     for cat in categories:
         cat_dir = dataset_path / cat
         if not cat_dir.is_dir():
             continue
-        files = [
-            f for f in sorted(cat_dir.glob("*.*"))
-            if not f.name.startswith(".") and f.suffix.lower() in supported_extensions
-        ]
+        all_candidate_files = sorted(cat_dir.rglob("*.*"))
+        files = []
+        for f in all_candidate_files:
+            if f.name.startswith(".") or not f.is_file():
+                continue
+            if f.suffix.lower() not in supported_extensions:
+                continue
+            # Explicit exclusion for maintenance/CMaps non-pdf files (numeric sensor data)
+            if cat == "maintenance" and "CMaps" in f.parts and f.suffix.lower() != ".pdf":
+                continue
+            files.append(f)
+
         if max_docs_per_category:
             files = files[:max_docs_per_category]
         for f in files:

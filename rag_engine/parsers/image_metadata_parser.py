@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import struct
 import uuid
@@ -147,7 +148,7 @@ class ImageMetadataParser(BaseParser):
         )
 
         return ParsedDocument(
-            document_id=f"parsed_{uuid.uuid4().hex[:12]}",
+            document_id=f"parsed_{hashlib.sha256(document.doc_id.encode('utf-8')).hexdigest()[:12]}",
             raw_document_id=document.doc_id,
             title=drawing_name,
             category="Engineering Drawing",

@@ -81,9 +81,13 @@ def verify_model_integrity(model_dir: Path) -> dict[str, Any]:
         return {"valid": False, "error": f"Tokenizer files missing in {model_dir}"}
 
     # 3. Check model weights
-    weights = list(model_dir.glob("*.safetensors")) + list(model_dir.glob("*.bin"))
-    if not weights and not (model_dir / "model.safetensors.index.json").exists():
-        return {"valid": False, "error": f"No model weight files (.safetensors, .bin) found in {model_dir}"}
+    weights = [
+        f for f in (list(model_dir.glob("*.safetensors")) + list(model_dir.glob("pytorch_model*.bin")))
+        if f.name != "training_args.bin"
+    ]
+    onnx_weights = list((model_dir / "onnx").glob("*.onnx")) if (model_dir / "onnx").exists() else []
+    if not weights and not onnx_weights and not (model_dir / "model.safetensors.index.json").exists():
+        return {"valid": False, "error": f"No model weight files (.safetensors, pytorch_model*.bin, or onnx) found in {model_dir}"}
 
     # 4. Compute checksums of key config files
     file_checksums: dict[str, str] = {}
@@ -95,7 +99,7 @@ def verify_model_integrity(model_dir: Path) -> dict[str, Any]:
     return {
         "valid": True,
         "model_dir": str(model_dir.resolve()),
-        "weights_count": len(weights),
+        "weights_count": len(weights) + len(onnx_weights),
         "file_checksums": file_checksums,
     }
 
@@ -169,9 +173,17 @@ def download_model(
         snapshot_path = snapshot_download(
             repo_id=repo_id,
             local_dir=str(dest_dir),
-            local_dir_use_symlinks=False,
             token=auth_token,
-            ignore_patterns=["*.msgpack", "*.h5", "*.ot", "flax_model.msgpack", "tf_model.h5"],
+            ignore_patterns=[
+                "*.msgpack",
+                "*.h5",
+                "*.ot",
+                "flax_model.msgpack",
+                "tf_model.h5",
+                "onnx/*",
+                "runs/*",
+                "*.tfevents*",
+            ],
         )
         logger.info("Downloaded '%s' successfully from Hugging Face Hub to %s", repo_id, snapshot_path)
         downloaded = True
@@ -181,7 +193,9 @@ def download_model(
     # Attempt 2: ModelScope mirror fallback
     if not downloaded:
         try:
-            from modelscope import snapshot_download as ms_snapshot_download
+            import importlib
+            ms = importlib.import_module("modelscope")
+            ms_snapshot_download = getattr(ms, "snapshot_download")
 
             logger.info("Downloading '%s' via ModelScope official mirror...", repo_id)
             snapshot_path = ms_snapshot_download(

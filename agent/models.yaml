@@ -1,0 +1,151 @@
+# ============================================================================
+# Agent Orchestration — Model Catalog
+# Sovereign On-Premise Agentic AI Workbench (MRPL)
+# ============================================================================
+#
+# Each entry describes one model the agent layer may use.
+# Fields:
+#   role           : Logical role  (rag | coding | vision | placeholder)
+#   hf_repo_id     : Hugging Face repo identifier (used as canonical key)
+#   local_path     : Path on disk relative to the project root
+#   family         : Architecture family (qwen | phi | smollm | llama | ...)
+#   context_window : Max tokens (input + output)
+#   quantization   : Default weight dtype  (fp16 | int8 | int4 | bf16)
+#   enabled        : Whether the agent should load / use this model
+#   description    : Human-readable notes for audit trail / operators
+#
+# Roles used by the router:
+#   rag         -> Calls RAGPipeline.answer() -- document-grounded answers
+#   coding      -> Dedicated code-generation model (future slot)
+#   vision      -> Multi-modal / OCR model (future slot)
+#   placeholder -> Declared but not yet downloaded; registry warns at startup
+
+models:
+
+  # -- Primary RAG model (Member 1's pipeline already uses this) -----------
+  - role: rag
+    name: qwen2.5-1.5b-instruct
+    hf_repo_id: Qwen/Qwen2.5-1.5B-Instruct
+    local_path: models/llm/qwen2.5-1.5b-instruct
+    family: qwen
+    context_window: 32768
+    quantization: fp16
+    model_type: causal_lm
+    capabilities: [text_generation, instruction_following, engineering_reasoning, rag_answering]
+    supported_tasks: [question_answering, summarization, engineering_reasoning]
+    runtime: transformers
+    device_requirements: {minimum_vram_gb: 0, preferred_device: cpu_or_cuda}
+    priority: 10
+    enabled: true
+    description: >
+      Qwen 2.5 1.5B Instruct. Primary generative LLM wired into Member 1's
+      RAGPipeline.  The agent calls pipeline.answer() which internally loads
+      this model; the agent does NOT load it again directly.
+
+  # -- SmolLM2 -- lightweight alternative RAG / fallback -------------------
+  - role: rag
+    name: smollm2-1.7b-instruct
+    hf_repo_id: HuggingFaceTB/SmolLM2-1.7B-Instruct
+    local_path: models/llm/smollm2-1.7b-instruct
+    family: smollm
+    context_window: 8192
+    quantization: fp16
+    model_type: causal_lm
+    capabilities: [text_generation, instruction_following, rag_answering]
+    supported_tasks: [question_answering, summarization]
+    runtime: transformers
+    device_requirements: {minimum_vram_gb: 0, preferred_device: cpu_or_cuda}
+    priority: 30
+    fallback_for: [Qwen/Qwen2.5-1.5B-Instruct]
+    enabled: true
+    description: >
+      SmolLM2 1.7B Instruct. Compact, fast alternative to Qwen.
+      Set enabled: true and update rag_engine config to activate.
+
+  # -- Phi-3.5 Mini -- higher-quality RAG / reasoning model ----------------
+  - role: rag
+    name: phi-3.5-mini-instruct
+    hf_repo_id: microsoft/Phi-3.5-mini-instruct
+    local_path: models/llm/phi-3.5-mini-instruct
+    family: phi
+    context_window: 131072
+    quantization: fp16
+    model_type: causal_lm
+    capabilities: [text_generation, instruction_following, long_context_reasoning, rag_answering]
+    supported_tasks: [question_answering, summarization, engineering_reasoning]
+    runtime: transformers
+    device_requirements: {minimum_vram_gb: 0, preferred_device: cpu_or_cuda}
+    priority: 20
+    enabled: true
+    description: >
+      Phi 3.5 Mini 3.8B. Strong reasoning and long-context capability.
+      Set enabled: true and update rag_engine config to activate.
+
+  # -- Coding model slot (placeholder -- not yet downloaded) ---------------
+  - role: coding
+    name: qwen2.5-coder-1.5b-instruct
+    hf_repo_id: Qwen/Qwen2.5-Coder-1.5B-Instruct
+    local_path: models/llm/qwen2.5-coder-1.5b-instruct
+    family: qwen
+    context_window: 32768
+    quantization: fp16
+    model_type: causal_lm
+    capabilities: [code_generation, instruction_following]
+    supported_tasks: [code_generation]
+    runtime: transformers
+    device_requirements: {minimum_vram_gb: 0, preferred_device: cpu_or_cuda}
+    priority: 10
+    enabled: false
+    description: >
+      Qwen 2.5 Coder 1.5B -- future slot for Python/SQL code generation tasks
+      (e.g. auto-generating inspection report scripts). Download and set
+      enabled: true when ready.
+
+  # -- Qwen2.5-VL visual-reasoning model (must be pre-staged; no downloads) -
+  - role: vision
+    name: qwen2.5-vl-3b-instruct
+    hf_repo_id: Qwen/Qwen2.5-VL-3B-Instruct
+    local_path: models/vision/qwen2.5-vl-3b-instruct
+    family: qwen_vl
+    context_window: 32768
+    quantization: fp16
+    model_type: vision_language_model
+    capabilities: [vision, image_understanding, multimodal_reasoning, document_image_analysis, engineering_drawing_analysis, pid_analysis, visual_question_answering]
+    supported_tasks: [image_understanding, document_image_analysis, engineering_drawing_analysis, pid_analysis, visual_question_answering]
+    runtime: transformers
+    device_requirements: {minimum_vram_gb: 8, preferred_device: cuda}
+    priority: 10
+    enabled: true
+    description: >
+      Local Qwen2.5-VL-3B-Instruct visual-reasoning model. Its complete local
+      weight directory is pre-staged at the path above. Runtime uses only those
+      files (never downloads); it is loaded lazily by the agent VLM adapter.
+
+  # -- Member 3 OCR/document pipeline (not an LLM or a Qwen substitute) -----
+  - role: ocr
+    name: member3-multimodal-processor
+    hf_repo_id: member3_ocr/multimodal_processor
+    local_path: member3_ocr
+    family: multimodal_ocr
+    context_window: 4096
+    quantization: fp32
+    model_type: ocr_document_pipeline
+    capabilities: [ocr, document_parsing, table_extraction]
+    supported_tasks: [scanned_document_text_extraction, document_parsing]
+    runtime: paddleocr_local
+    device_requirements: {minimum_vram_gb: 0, preferred_device: cpu_or_cuda}
+    priority: 10
+    enabled: true
+    description: >
+      Member 3 Sovereign Multimodal OCR & Document Processor for P&ID drawings,
+      equipment nameplates, and scanned inspection reports. Runs 100% offline.
+
+# -- Embedding model (used by Member 1's retrieval -- read-only reference) --
+embedding:
+  hf_repo_id: BAAI/bge-small-en-v1.5
+  local_path: models/embeddings/bge-small-en-v1.5
+  dimensions: 384
+  description: >
+    BGE Small EN v1.5. Loaded by Member 1's EmbeddingPipeline.
+    Declared here for documentation / health-check purposes only;
+    the agent does NOT load this model directly.

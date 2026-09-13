@@ -12,6 +12,34 @@ from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from rag_engine.schemas.vector_store import DistanceMetric, PayloadSchemaType
+from rag_engine.config.runtime_paths import runtime_file
+
+
+def _runtime_root() -> Path:
+    """Return a writable runtime root without mutating source/index data.
+
+    Embedded Qdrant requires exclusive write access to its lock and SQLite
+    files.  A checked-out repository is often read-only (or shared by several
+    developers), so it is never a safe default persistence location.  An
+    operator may set ``SOVEREIGNAI_RUNTIME_DIR`` to a managed local volume.
+    """
+    return runtime_file()
+
+
+def default_vector_storage_path() -> Path:
+    return _runtime_root() / "vector_db" / "qdrant"
+
+
+def default_journal_path() -> Path:
+    return _runtime_root() / "vector_db" / "journal"
+
+
+def default_backup_path() -> Path:
+    return _runtime_root() / "vector_db" / "backups"
+
+
+def default_telemetry_path() -> Path:
+    return _runtime_root() / "vector_db" / "telemetry"
 
 
 class HNSWConfig(BaseModel):
@@ -83,12 +111,12 @@ class VectorStoreConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     backend: str = Field(default="qdrant", description="Vector database engine: 'qdrant', 'milvus', etc.")
-    storage_path: Path = Field(default=Path("vector_db/qdrant"), description="Local embedded filesystem directory")
+    storage_path: Path = Field(default_factory=default_vector_storage_path, description="Local embedded filesystem directory")
     url: Optional[str] = Field(default=None, description="Network URL if running in distributed Qdrant Server mode")
     api_key: Optional[str] = Field(default=None, description="Optional API key for distributed server mode")
     timeout_seconds: float = Field(default=30.0, description="Default operational timeout in seconds")
     batch_size: int = Field(default=500, description="Default chunk slicing batch size for ingestion")
     enable_wal_journal: bool = Field(default=True, description="Maintain transaction write-ahead logging journal")
-    journal_path: Path = Field(default=Path("vector_db/journal"), description="Directory for transaction WAL records")
-    backup_path: Path = Field(default=Path("vector_db/backups"), description="Directory for tar.gz snapshots")
-    telemetry_path: Path = Field(default=Path("vector_db/telemetry"), description="Directory for storage stats")
+    journal_path: Path = Field(default_factory=default_journal_path, description="Directory for transaction WAL records")
+    backup_path: Path = Field(default_factory=default_backup_path, description="Directory for tar.gz snapshots")
+    telemetry_path: Path = Field(default_factory=default_telemetry_path, description="Directory for storage stats")

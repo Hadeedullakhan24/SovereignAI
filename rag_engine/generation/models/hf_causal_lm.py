@@ -79,14 +79,33 @@ class HFLocalLLM(BaseLLM):
                 from transformers import AutoModelForCausalLM, AutoTokenizer
 
                 logger.info("Loading local LLM tokenizer from %s [local_files_only=True]", self.model_path)
-                self._tokenizer = AutoTokenizer.from_pretrained(
+                raw_tok: Any = AutoTokenizer.from_pretrained(
                     str(self.model_path),
                     local_files_only=True,
                     trust_remote_code=False,
                 )
+                if raw_tok is None:
+                    raise ModelLoadingError(f"Failed to load tokenizer from {self.model_path}")
 
-                if self._tokenizer.pad_token is None:
-                    self._tokenizer.pad_token = self._tokenizer.eos_token
+                tok: Any = raw_tok
+                if tok.pad_token is None:
+                    tok.pad_token = tok.eos_token
+
+                # Ensure <|im_end|> and <|endoftext|> are included in eos_token_id
+                eos_ids = set()
+                if tok.eos_token_id is not None:
+                    if isinstance(tok.eos_token_id, list):
+                        eos_ids.update(tok.eos_token_id)
+                    else:
+                        eos_ids.add(tok.eos_token_id)
+
+                for tok_str in ("<|im_end|>", "<|endoftext|>"):
+                    tok_id = tok.convert_tokens_to_ids(tok_str)
+                    if tok_id is not None and isinstance(tok_id, int) and tok_id != getattr(tok, "unk_token_id", None):
+                        eos_ids.add(tok_id)
+
+                self._tokenizer = tok
+                self._eos_token_ids = list(eos_ids) if eos_ids else tok.eos_token_id
 
                 target_device = self.device if self.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -113,13 +132,20 @@ class HFLocalLLM(BaseLLM):
                         logger.info("Setting PyTorch CPU inference threads to %d", configured_threads)
                         torch.set_num_threads(configured_threads)
 
+                try:
+                    import accelerate  # noqa: F401
+                    _has_accelerate = True
+                except ImportError:
+                    _has_accelerate = False
+
                 load_kwargs: dict[str, Any] = {
                     "local_files_only": True,
                     "dtype": dtype,
-                    "device_map": target_device,
                     "trust_remote_code": False,
                     "low_cpu_mem_usage": True,
                 }
+                if _has_accelerate:
+                    load_kwargs["device_map"] = target_device
 
                 # Optional 8-bit / 4-bit quantization support via bitsandbytes
                 if self.quantization == QuantizationType.INT8:
@@ -138,6 +164,8 @@ class HFLocalLLM(BaseLLM):
                     str(self.model_path),
                     **load_kwargs,
                 )
+                if not _has_accelerate:
+                    self._model = self._model.to(target_device)
                 self._model.eval()
                 self._load_time_ms = (time.perf_counter() - start) * 1000.0
                 logger.info(
@@ -156,6 +184,43 @@ class HFLocalLLM(BaseLLM):
         self._lazy_load()
         return len(self._tokenizer.encode(text, add_special_tokens=False))
 
+    def _format_prompt(self, prompt: str) -> str:
+        """Format prompt using tokenizer chat template if available and not already formatted."""
+        if not prompt or "<|im_start|>" in prompt or not getattr(self._tokenizer, "chat_template", None):
+            return prompt
+
+        if "=== SYSTEM INSTRUCTIONS ===" in prompt:
+            parts = prompt.split("=== SYSTEM INSTRUCTIONS ===", 1)[1]
+            split_markers = [
+                "\n=== PREVIOUS CONVERSATION TURNS ===",
+                "=== PREVIOUS CONVERSATION TURNS ===",
+                "\n=== VERIFIED MRPL REFINERY GROUND TRUTH CONTEXT ===",
+                "=== VERIFIED MRPL REFINERY GROUND TRUTH CONTEXT ===",
+                "\n=== USER QUERY ===",
+                "=== USER QUERY ===",
+            ]
+            split_at = None
+            for m in split_markers:
+                if m in parts:
+                    split_at = m
+                    break
+            if split_at:
+                sys_part, rest = parts.split(split_at, 1)
+                user_msg = (split_at.strip("\n") + "\n" + rest).replace("\nASSISTANT: ", "").strip()
+            else:
+                sys_part, user_msg = parts.replace("\nASSISTANT: ", "").strip(), ""
+            messages = [
+                {"role": "system", "content": sys_part.strip()},
+                {"role": "user", "content": user_msg},
+            ]
+            return str(self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+        elif "ASSISTANT: " in prompt:
+            user_msg = prompt.replace("\nASSISTANT: ", "").strip()
+            messages = [{"role": "user", "content": user_msg}]
+            return str(self._tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+
+        return prompt
+
     def generate(
         self,
         prompt: str,
@@ -168,12 +233,14 @@ class HFLocalLLM(BaseLLM):
         try:
             import torch
 
-            inputs = self._tokenizer(prompt, return_tensors="pt")
+            formatted_prompt = self._format_prompt(prompt)
+            inputs = self._tokenizer(formatted_prompt, return_tensors="pt")
             prompt_tokens = inputs.input_ids.shape[1]
 
             device = next(self._model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
+            effective_eos = getattr(self, "_eos_token_ids", None) or self._tokenizer.eos_token_id
             gen_kwargs = {
                 "max_new_tokens": cfg.max_new_tokens,
                 "temperature": max(cfg.temperature, 1e-5),
@@ -182,15 +249,24 @@ class HFLocalLLM(BaseLLM):
                 "repetition_penalty": cfg.repetition_penalty,
                 "do_sample": cfg.temperature > 0.0,
                 "pad_token_id": self._tokenizer.pad_token_id,
-                "eos_token_id": self._tokenizer.eos_token_id,
+                "eos_token_id": effective_eos,
             }
+            if cfg.stop_sequences:
+                gen_kwargs["stop_strings"] = cfg.stop_sequences
+                gen_kwargs["tokenizer"] = self._tokenizer
 
             with torch.no_grad():
                 outputs = self._model.generate(**inputs, **gen_kwargs)
 
             generated_ids = outputs[0][prompt_tokens:]
             completion_tokens = len(generated_ids)
-            text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+            text = self._tokenizer.decode(generated_ids, skip_special_tokens=True).replace("\r\n", "\n").replace("\r", "\n")
+
+            # Clean trailing stop markers if any leaked through decoding
+            if cfg.stop_sequences:
+                for stop_seq in cfg.stop_sequences:
+                    if stop_seq in text:
+                        text = text.split(stop_seq)[0]
 
             return LLMGenerationOutput(
                 text=text.strip(),
@@ -213,7 +289,8 @@ class HFLocalLLM(BaseLLM):
         try:
             from transformers import TextIteratorStreamer
 
-            inputs = self._tokenizer(prompt, return_tensors="pt")
+            formatted_prompt = self._format_prompt(prompt)
+            inputs = self._tokenizer(formatted_prompt, return_tensors="pt")
             device = next(self._model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -223,6 +300,7 @@ class HFLocalLLM(BaseLLM):
                 skip_special_tokens=True,
             )
 
+            effective_eos = getattr(self, "_eos_token_ids", None) or self._tokenizer.eos_token_id
             gen_kwargs = {
                 **inputs,
                 "streamer": streamer,
@@ -233,8 +311,11 @@ class HFLocalLLM(BaseLLM):
                 "repetition_penalty": cfg.repetition_penalty,
                 "do_sample": cfg.temperature > 0.0,
                 "pad_token_id": self._tokenizer.pad_token_id,
-                "eos_token_id": self._tokenizer.eos_token_id,
+                "eos_token_id": effective_eos,
             }
+            if cfg.stop_sequences:
+                gen_kwargs["stop_strings"] = cfg.stop_sequences
+                gen_kwargs["tokenizer"] = self._tokenizer
 
             thread = threading.Thread(target=self._model.generate, kwargs=gen_kwargs)
             thread.start()

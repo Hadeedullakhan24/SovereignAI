@@ -615,7 +615,8 @@ def test_real_qwen25_vl_integration() -> None:
     7. Reports inference latency
     8. Does NOT download anything
     """
-    model_path = Path("C:/SovereignAI/models/vision/qwen2.5-vl-3b-instruct")
+    project_root = Path(__file__).resolve().parents[2]
+    model_path = project_root / "models" / "vision" / "qwen2.5-vl-3b-instruct"
     if not model_path.exists():
         pytest.skip(f"Local model directory not found: {model_path}")
 
@@ -628,7 +629,7 @@ def test_real_qwen25_vl_integration() -> None:
 import json, sys, time
 from pathlib import Path
 
-sys.path.insert(0, "c:/SovereignAI")
+sys.path.insert(0, r"{project_root}")
 from member3_ocr.core.vision_pipeline import (
     LocalQwenVisionBackend,
     VisionModelConfig,
@@ -673,7 +674,7 @@ print(json.dumps(out))
         capture_output=True,
         text=True,
         timeout=1200,
-        cwd="c:/SovereignAI",
+        cwd=str(project_root),
     )
     assert proc.returncode == 0, f"Integration test failed (stderr: {proc.stderr})"
     assert "---RESULT_PAYLOAD---" in proc.stdout, f"Payload marker missing: {proc.stdout}"
