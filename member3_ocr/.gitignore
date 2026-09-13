@@ -1,0 +1,34 @@
+# Member 3 Local Git Ignore
+
+# Local AI models — never commit model weights
+models/
+
+# Generated outputs/evaluation artifacts
+output/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test/tool caches
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+member3_env/
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
