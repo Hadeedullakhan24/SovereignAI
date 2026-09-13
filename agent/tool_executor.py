@@ -4,10 +4,18 @@ Provides deterministic and safe tool execution for the agent workbench:
   1. rag_search         : Real integration with Member 1's RAGPipeline.
                           Handles 'Insufficient Evidence' gracefully as a valid status.
   2. calculator         : Safe mathematical & engineering formula evaluator via AST (no raw eval).
+                          Returns (result, steps) — steps is an ordered list of intermediate
+                          reduction strings suitable for inclusion in audit reports.
   3. file_manager       : Strictly sandboxed file I/O (read/write/list) within a project directory.
   4. python_execution   : Subprocess-isolated script execution with timeouts and restricted builtins.
   5. document_generator : Professional Word (.docx) report generator using python-docx.
-  6. audit_logger       : Append-only JSONL log of every tool execution for governance.
+  6. xlsx_generator     : Excel workbook generator using openpyxl.
+  7. pptx_generator     : PowerPoint presentation generator using python-pptx.
+  8. pdf_generator      : PDF converter on top of .docx output (docx2pdf / libreoffice --headless).
+  9. audit_logger       : Append-only JSONL log of every tool execution for governance.
+
+All tool branches catch their own exceptions and return a structured ToolResult(error=...);
+no unhandled exception propagates to the caller (no silent 500s).
 
 ToolExecutor.execute() directly consumes a RoutingDecision (or tool_name/use_rag_context),
 coordinating RAG context retrieval with deterministic calculation tools seamlessly.
@@ -54,14 +62,12 @@ DEFAULT_PROJECT_ROOT = _PROJECT_ROOT
 DEFAULT_SANDBOX_DIR = DEFAULT_PROJECT_ROOT / "workspace_sandbox"
 DEFAULT_AUDIT_LOG_FILE = DEFAULT_PROJECT_ROOT / "logs" / "agent_audit.jsonl"
 
-# Contracts exposed to the planner/backend for generators owned by other
-# modules.  Only DOCX is implemented here; the remaining entries deliberately
-# advertise an unavailable capability instead of manufacturing a file.
+# Contracts exposed to the planner/backend for generators.
 DOCUMENT_TOOL_CONTRACTS: Dict[str, Dict[str, Any]] = {
     "document_generator": {"format": "docx", "implemented": True, "input": ["title", "sections", "filename", "metadata"], "output": ["path", "file_size_bytes"]},
-    "xlsx_generator": {"format": "xlsx", "implemented": False, "input": ["workbook", "filename"], "output": ["path", "metadata"]},
-    "pptx_generator": {"format": "pptx", "implemented": False, "input": ["slides", "filename"], "output": ["path", "metadata"]},
-    "pdf_generator": {"format": "pdf", "implemented": False, "input": ["content", "filename"], "output": ["path", "metadata"]},
+    "xlsx_generator": {"format": "xlsx", "implemented": True, "input": ["workbook", "filename"], "output": ["path", "metadata"]},
+    "pptx_generator": {"format": "pptx", "implemented": True, "input": ["slides", "filename"], "output": ["path", "metadata"]},
+    "pdf_generator": {"format": "pdf", "implemented": True, "input": ["docx_filename", "out_filename"], "output": ["path", "metadata"]},
 }
 
 
@@ -93,6 +99,10 @@ class ToolResult:
     fallback_warning: Optional[str] = None
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.status in ("error", "capability_unavailable", "timeout"):
+            self.is_verified = False
 
     @property
     def is_success(self) -> bool:
@@ -213,13 +223,21 @@ class SafeCalculator:
 
     def evaluate(
         self, expression: str, variables: Optional[Dict[str, float]] = None
-    ) -> float:
+    ) -> Tuple[float, List[str]]:
         """Parse and safely evaluate a mathematical expression.
 
         Parameters
         ----------
         expression : e.g. '(P * R) / (S * E - 0.6 * P)' or 'sqrt(144) + 12.5'
         variables  : optional dictionary of numeric variable values
+
+        Returns
+        -------
+        (result, steps)
+          result : float  — the final computed value.
+          steps  : List[str] — ordered list of intermediate reduction strings
+                   showing substituted variable values, sub-expression results,
+                   and the final answer.  Suitable for inclusion in audit reports.
         """
         if not expression or not expression.strip():
             raise ValueError("Empty calculation expression provided.")
@@ -232,10 +250,30 @@ class SafeCalculator:
             raise ValueError(f"Syntax error in expression: {e}") from e
 
         var_dict = {k: float(v) for k, v in (variables or {}).items()}
-        return self._eval_node(tree.body, var_dict)
+        steps: List[str] = []
+
+        # Record variable substitution as the first step
+        if var_dict:
+            sub_parts = ", ".join(f"{k} = {v}" for k, v in sorted(var_dict.items()))
+            steps.append(f"Variable substitution: {sub_parts}")
+
+        result = self._eval_node_traced(tree.body, var_dict, steps, depth=0)
+        steps.append(f"Final result: {expression} = {result:.6g}")
+        return result, steps
 
     def _eval_node(self, node: ast.AST, variables: Dict[str, float]) -> float:
-        """Recursively evaluate an approved AST node."""
+        """Recursively evaluate an approved AST node (no step tracing)."""
+        val, _ = self.evaluate.__wrapped__(self, ast.Expression(body=node), variables) if False else (None, None)
+        return self._eval_node_traced(node, variables, [], depth=99)
+
+    def _eval_node_traced(
+        self,
+        node: ast.AST,
+        variables: Dict[str, float],
+        steps: List[str],
+        depth: int,
+    ) -> float:
+        """Recursively evaluate an approved AST node, emitting step traces."""
         # 1. Numbers / Constants
         if isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float)):
@@ -255,20 +293,33 @@ class SafeCalculator:
         if isinstance(node, ast.UnaryOp):
             op_type = type(node.op)
             if op_type in self.ALLOWED_OPERATORS:
-                operand_val = self._eval_node(node.operand, variables)
-                return self.ALLOWED_OPERATORS[op_type](operand_val)
+                operand_val = self._eval_node_traced(node.operand, variables, steps, depth + 1)
+                result = self.ALLOWED_OPERATORS[op_type](operand_val)
+                if depth <= 1:
+                    op_sym = "-" if op_type == ast.USub else "+"
+                    steps.append(f"Unary {op_sym}({operand_val}) = {result:.6g}")
+                return result
             raise ValueError(f"Disallowed unary operator: {op_type.__name__}")
 
         # 4. Binary operations (x + y, x * y, x ** y, etc.)
         if isinstance(node, ast.BinOp):
             op_type = type(node.op)
             if op_type in self.ALLOWED_OPERATORS:
-                left_val = self._eval_node(node.left, variables)
-                right_val = self._eval_node(node.right, variables)
+                left_val = self._eval_node_traced(node.left, variables, steps, depth + 1)
+                right_val = self._eval_node_traced(node.right, variables, steps, depth + 1)
                 # Check zero division
                 if op_type in (ast.Div, ast.FloorDiv, ast.Mod) and right_val == 0:
                     raise ZeroDivisionError("Division by zero in mathematical expression.")
-                return self.ALLOWED_OPERATORS[op_type](left_val, right_val)
+                result = self.ALLOWED_OPERATORS[op_type](left_val, right_val)
+                # Emit a step for top-level binary ops to make the working visible
+                if depth <= 2:
+                    _OP_SYM = {
+                        ast.Add: "+", ast.Sub: "-", ast.Mult: "×",
+                        ast.Div: "÷", ast.FloorDiv: "//", ast.Mod: "%", ast.Pow: "^",
+                    }
+                    op_sym = _OP_SYM.get(op_type, str(op_type.__name__))
+                    steps.append(f"  {left_val:.6g} {op_sym} {right_val:.6g} = {result:.6g}")
+                return result
             raise ValueError(f"Disallowed binary operator: {op_type.__name__}")
 
         # 5. Function calls (sqrt, sin, abs, etc.)
@@ -278,8 +329,12 @@ class SafeCalculator:
             func_name = node.func.id
             if func_name not in self.ALLOWED_FUNCTIONS:
                 raise ValueError(f"Disallowed function call: {func_name!r}")
-            evaluated_args = [self._eval_node(arg, variables) for arg in node.args]
-            return float(self.ALLOWED_FUNCTIONS[func_name](*evaluated_args))
+            evaluated_args = [self._eval_node_traced(arg, variables, steps, depth + 1) for arg in node.args]
+            result = float(self.ALLOWED_FUNCTIONS[func_name](*evaluated_args))
+            if depth <= 2:
+                args_str = ", ".join(f"{a:.6g}" for a in evaluated_args)
+                steps.append(f"  {func_name}({args_str}) = {result:.6g}")
+            return result
 
         # Disallow everything else (lambdas, attributes, imports, subscriptions, etc.)
         raise ValueError(f"Disallowed expression element: {type(node).__name__}")
@@ -561,7 +616,442 @@ class DocumentGenerator:
         }
 
 
-# ── 6. Multimodal OCR & Vision Inspector Tool ─────────────────────────────
+
+# ── 6. Spreadsheet Generator (openpyxl) ───────────────────────────────────
+
+class SpreadsheetGenerator:
+    """Generates Excel (.xlsx) workbooks with styled headers and data rows.
+
+    Input structure (`workbook` dict):
+      {
+        "title": str,
+        "sheets": [
+          {
+            "name": str,
+            "headers": [str, ...],
+            "rows": [[value, ...], ...],
+            "metadata": {key: value, ...}   # optional; placed as info rows above table
+          },
+          ...
+        ]
+      }
+    If `workbook` is None a sample single-sheet workbook is generated.
+    """
+
+    # Colour palette (ARGB hex strings for openpyxl)
+    _HEADER_FILL    = "FF102C57"   # deep navy
+    _ALT_ROW_FILL   = "FFE8EEF5"   # light blue-grey
+    _BORDER_COLOUR  = "FFB0BEC5"
+
+    def __init__(self, file_manager: SandboxedFileManager) -> None:
+        self.file_manager = file_manager
+
+    def generate(
+        self,
+        workbook: Optional[Dict[str, Any]] = None,
+        filename: str = "report.xlsx",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create and save a styled .xlsx workbook inside the sandbox."""
+        import openpyxl
+        from openpyxl.styles import (
+            PatternFill, Font, Alignment, Border, Side, GradientFill
+        )
+        from openpyxl.utils import get_column_letter
+
+        wb_spec = workbook or {
+            "title": "Agent Workbench Report",
+            "sheets": [
+                {
+                    "name": "Summary",
+                    "headers": ["Parameter", "Value", "Unit", "Status"],
+                    "rows": [
+                        ["Design Pressure", "10.5", "kg/cm²g", "EXTRACTED"],
+                        ["Shell Min Thickness", "11.2", "mm", "EXTRACTED"],
+                        ["Calculated t_min", "5.40", "mm", "CALCULATED"],
+                        ["Safety Margin", "5.80", "mm", "ACCEPTABLE"],
+                    ],
+                }
+            ],
+        }
+
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)   # remove default empty sheet
+
+        title_str = wb_spec.get("title", "Report")
+        gen_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        header_fill  = PatternFill("solid", fgColor=self._HEADER_FILL)
+        alt_row_fill = PatternFill("solid", fgColor=self._ALT_ROW_FILL)
+        thin_side    = Side(border_style="thin", color=self._BORDER_COLOUR)
+        thin_border  = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+        for sheet_spec in wb_spec.get("sheets", []):
+            ws = wb.create_sheet(title=sheet_spec.get("name", "Sheet"))
+
+            # ── Title row ────────────────────────────────────────────────
+            ws.merge_cells("A1:H1")
+            ws["A1"] = f"{title_str}  |  Generated: {gen_date}"
+            ws["A1"].font = Font(bold=True, size=13, color="FFFFFFFF")
+            ws["A1"].fill = header_fill
+            ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+            ws.row_dimensions[1].height = 24
+
+            # ── Optional metadata rows ───────────────────────────────────
+            row_cursor = 2
+            meta_items = {**(metadata or {}), **sheet_spec.get("metadata", {})}
+            if meta_items:
+                for k, v in meta_items.items():
+                    ws.cell(row=row_cursor, column=1, value=str(k)).font = Font(bold=True, size=9, color="FF102C57")
+                    ws.cell(row=row_cursor, column=2, value=str(v)).font = Font(size=9)
+                    row_cursor += 1
+                row_cursor += 1   # blank separator
+
+            # ── Header row ──────────────────────────────────────────────
+            headers = sheet_spec.get("headers", [])
+            for col_idx, h_text in enumerate(headers, start=1):
+                cell = ws.cell(row=row_cursor, column=col_idx, value=str(h_text))
+                cell.font      = Font(bold=True, size=10, color="FFFFFFFF")
+                cell.fill      = header_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border    = thin_border
+            ws.row_dimensions[row_cursor].height = 18
+            header_row = row_cursor
+            row_cursor += 1
+
+            # ── Data rows ───────────────────────────────────────────────
+            for r_idx, row_vals in enumerate(sheet_spec.get("rows", [])):
+                fill = alt_row_fill if r_idx % 2 == 1 else None
+                for col_idx, val in enumerate(row_vals, start=1):
+                    cell = ws.cell(row=row_cursor, column=col_idx, value=val)
+                    cell.font   = Font(size=9)
+                    cell.border = thin_border
+                    if fill:
+                        cell.fill = fill
+                row_cursor += 1
+
+            # ── Auto-fit column widths ───────────────────────────────────
+            for col in ws.columns:
+                max_len = 0
+                col_letter = get_column_letter(col[0].column)
+                for cell in col:
+                    try:
+                        max_len = max(max_len, len(str(cell.value or "")))
+                    except Exception:
+                        pass
+                ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
+
+            ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
+
+        # Save to sandbox
+        safe_path = self.file_manager._resolve_safe_path(filename)
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(safe_path))
+
+        return {
+            "status": "success",
+            "filename": filename,
+            "path": str(safe_path),
+            "file_size_bytes": safe_path.stat().st_size,
+            "sheets": [s.get("name") for s in wb_spec.get("sheets", [])],
+        }
+
+
+# ── 7. Presentation Generator (python-pptx) ────────────────────────────────
+
+class PresentationGenerator:
+    """Generates PowerPoint (.pptx) presentations with a branded theme.
+
+    Input structure (`slides` list):
+      [
+        {"title": str, "content": str | List[str], "bullets": [str,...], "table": {...}},
+        ...
+      ]
+    First slide is always a title-card; subsequent slides use a body layout.
+    """
+
+    def __init__(self, file_manager: SandboxedFileManager) -> None:
+        self.file_manager = file_manager
+
+    def generate(
+        self,
+        title: str = "Agent Workbench Report",
+        slides: Optional[List[Dict[str, Any]]] = None,
+        filename: str = "report.pptx",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create and save a styled .pptx presentation inside the sandbox."""
+        from pptx import Presentation
+        from pptx.util import Inches, Pt, Emu
+        from pptx.dml.color import RGBColor
+        from pptx.enum.text import PP_ALIGN
+        from pptx.util import Inches, Pt
+
+        # Theme colours
+        NAVY  = RGBColor(0x10, 0x2C, 0x57)   # deep industrial navy
+        WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+        SLATE = RGBColor(0x64, 0x6E, 0x78)   # steel grey
+        AMBER = RGBColor(0xE6, 0x8A, 0x00)   # accent
+
+        gen_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        prs = Presentation()
+        prs.slide_width  = Inches(13.33)
+        prs.slide_height = Inches(7.5)
+
+        blank_layout = prs.slide_layouts[6]   # completely blank
+
+        def _set_bg(slide, colour: RGBColor) -> None:
+            """Fill slide background with solid colour."""
+            from pptx.oxml.ns import qn
+            from lxml import etree
+            bg = slide.background
+            fill = bg.fill
+            fill.solid()
+            fill.fore_color.rgb = colour
+
+        def _add_textbox(
+            slide, left, top, width, height, text, bold=False, size=18,
+            colour=WHITE, align=PP_ALIGN.LEFT, wrap=True
+        ):
+            txb = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+            tf  = txb.text_frame
+            tf.word_wrap = wrap
+            p = tf.paragraphs[0]
+            p.alignment = align
+            run = p.add_run()
+            run.text = text
+            run.font.bold  = bold
+            run.font.size  = Pt(size)
+            run.font.color.rgb = colour
+            return txb
+
+        # ── Slide 1: Title card ─────────────────────────────────────────
+        title_slide = prs.slides.add_slide(blank_layout)
+        _set_bg(title_slide, NAVY)
+
+        # Accent bar (top)
+        bar = title_slide.shapes.add_shape(
+            1, Inches(0), Inches(0), Inches(13.33), Inches(0.35)
+        )  # 1 = MSO_SHAPE_TYPE.RECTANGLE
+        bar.fill.solid()
+        bar.fill.fore_color.rgb = AMBER
+        bar.line.fill.background()
+
+        _add_textbox(title_slide, 0.6, 1.5, 12, 1.4, title, bold=True, size=32, colour=WHITE, align=PP_ALIGN.CENTER)
+        subtitle = f"Sovereign AI Engineering Workbench  |  {gen_date}"
+        _add_textbox(title_slide, 0.6, 3.0, 12, 0.6, subtitle, bold=False, size=14, colour=SLATE.__class__(0xAA, 0xC4, 0xE0), align=PP_ALIGN.CENTER)
+        if metadata:
+            meta_str = "  •  ".join(f"{k}: {v}" for k, v in metadata.items())
+            _add_textbox(title_slide, 0.6, 3.8, 12, 0.5, meta_str, size=11, colour=SLATE.__class__(0xAA, 0xC4, 0xE0), align=PP_ALIGN.CENTER)
+
+        # Footer bar
+        footer_bar = title_slide.shapes.add_shape(1, Inches(0), Inches(7.15), Inches(13.33), Inches(0.35))
+        footer_bar.fill.solid()
+        footer_bar.fill.fore_color.rgb = AMBER
+        footer_bar.line.fill.background()
+
+        # ── Content slides ──────────────────────────────────────────────
+        slide_specs = slides or [
+            {"title": "Executive Summary", "content": "No content provided."},
+        ]
+        for slide_spec in slide_specs:
+            s = prs.slides.add_slide(blank_layout)
+            _set_bg(s, WHITE)
+
+            # Header band
+            hdr = s.shapes.add_shape(1, Inches(0), Inches(0), Inches(13.33), Inches(1.1))
+            hdr.fill.solid()
+            hdr.fill.fore_color.rgb = NAVY
+            hdr.line.fill.background()
+
+            slide_title = slide_spec.get("title", "Slide")
+            _add_textbox(s, 0.3, 0.15, 12.7, 0.8, slide_title, bold=True, size=20, colour=WHITE)
+
+            y_cursor = 1.3
+
+            # Body text / content
+            content = slide_spec.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(content)
+            if content:
+                _add_textbox(s, 0.5, y_cursor, 12.3, 1.2, content, size=13, colour=NAVY)
+                y_cursor += 1.4
+
+            # Bullet points
+            bullets = slide_spec.get("bullets", [])
+            if bullets:
+                bullet_text = "\n".join(f"  •  {b}" for b in bullets)
+                _add_textbox(s, 0.5, y_cursor, 12.3, min(3.0, 0.4 * len(bullets) + 0.3),
+                             bullet_text, size=12, colour=NAVY)
+                y_cursor += min(3.2, 0.4 * len(bullets) + 0.5)
+
+            # Simple table via add_table
+            tbl_data = slide_spec.get("table")
+            if tbl_data and "headers" in tbl_data and "rows" in tbl_data:
+                headers = tbl_data["headers"]
+                rows    = tbl_data["rows"]
+                n_rows  = 1 + len(rows)
+                n_cols  = len(headers)
+                col_w   = Inches(min(12.0 / n_cols, 3.0))
+                row_h   = Inches(0.35)
+                tbl_h   = row_h * n_rows
+                tbl_shape = s.shapes.add_table(
+                    n_rows, n_cols,
+                    Inches(0.5), Inches(min(y_cursor, 6.8)),
+                    Inches(12.3), tbl_h
+                )
+                tbl = tbl_shape.table
+                for c_idx, h in enumerate(headers):
+                    cell = tbl.cell(0, c_idx)
+                    cell.text = h
+                    cell.text_frame.paragraphs[0].runs[0].font.bold = True
+                    cell.text_frame.paragraphs[0].runs[0].font.size = Pt(10)
+                    cell.text_frame.paragraphs[0].runs[0].font.color.rgb = WHITE
+                    cell.fill.solid()
+                    cell.fill.fore_color.rgb = NAVY
+                for r_idx, row_vals in enumerate(rows):
+                    for c_idx, val in enumerate(row_vals):
+                        if c_idx < n_cols:
+                            tbl.cell(r_idx + 1, c_idx).text = str(val)
+                            tbl.cell(r_idx + 1, c_idx).text_frame.paragraphs[0].runs[0].font.size = Pt(9)
+
+            # Footer bar
+            fb = s.shapes.add_shape(1, Inches(0), Inches(7.15), Inches(13.33), Inches(0.35))
+            fb.fill.solid()
+            fb.fill.fore_color.rgb = AMBER
+            fb.line.fill.background()
+
+        # Save to sandbox
+        safe_path = self.file_manager._resolve_safe_path(filename)
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+        prs.save(str(safe_path))
+
+        return {
+            "status": "success",
+            "filename": filename,
+            "path": str(safe_path),
+            "file_size_bytes": safe_path.stat().st_size,
+            "slide_count": len(prs.slides),
+        }
+
+
+# ── 8. PDF Converter ────────────────────────────────────────────────────────
+
+class PDFConverter:
+    """Converts an existing .docx file in the sandbox to PDF.
+
+    Conversion priority (fully offline, no network calls):
+      1. docx2pdf — uses Microsoft Word COM on Windows if Word is installed.
+      2. libreoffice --headless --convert-to pdf — requires LibreOffice in PATH.
+      3. Returns capability_unavailable with a clear message if neither is present.
+    """
+
+    def __init__(self, file_manager: SandboxedFileManager) -> None:
+        self.file_manager = file_manager
+
+    @staticmethod
+    def _find_libreoffice() -> Optional[str]:
+        """Locate the LibreOffice binary (cross-platform)."""
+        candidates = [
+            "libreoffice", "soffice",
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            "/usr/bin/libreoffice", "/usr/bin/soffice",
+            "/opt/libreoffice/program/soffice",
+        ]
+        for cmd in candidates:
+            path = Path(cmd)
+            if path.is_file():
+                return str(path)
+            try:
+                result = subprocess.run(
+                    [cmd, "--version"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    return cmd
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+        return None
+
+    def convert(
+        self,
+        docx_filename: str,
+        out_filename: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Convert a .docx file in the sandbox to PDF.
+
+        Parameters
+        ----------
+        docx_filename : Relative path to the .docx inside the sandbox.
+        out_filename  : Output PDF filename (defaults to same name with .pdf extension).
+        """
+        docx_path = self.file_manager._resolve_safe_path(docx_filename)
+        if not docx_path.is_file():
+            raise FileNotFoundError(f"Source .docx not found in sandbox: {docx_filename}")
+
+        if out_filename is None:
+            out_filename = Path(docx_filename).with_suffix(".pdf").name
+        pdf_path = self.file_manager._resolve_safe_path(out_filename)
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # ── Strategy 1: docx2pdf ──────────────────────────────────────
+        try:
+            import importlib
+            d2p = importlib.import_module("docx2pdf")
+            d2p_convert = getattr(d2p, "convert")
+            d2p_convert(str(docx_path), str(pdf_path))
+            if pdf_path.is_file() and pdf_path.stat().st_size > 0:
+                return {
+                    "status": "success",
+                    "converter": "docx2pdf",
+                    "filename": out_filename,
+                    "path": str(pdf_path),
+                    "file_size_bytes": pdf_path.stat().st_size,
+                }
+        except (ImportError, ModuleNotFoundError):
+            pass
+        except Exception as exc:
+            logger.warning("docx2pdf conversion failed (%s); trying libreoffice.", exc)
+
+        # ── Strategy 2: LibreOffice headless ─────────────────────────
+        lo_bin = self._find_libreoffice()
+        if lo_bin:
+            try:
+                out_dir = str(pdf_path.parent)
+                proc = subprocess.run(
+                    [lo_bin, "--headless", "--convert-to", "pdf",
+                     "--outdir", out_dir, str(docx_path)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                # LibreOffice writes <docx_stem>.pdf in outdir
+                lo_out = pdf_path.parent / (docx_path.stem + ".pdf")
+                if lo_out.is_file() and lo_out.stat().st_size > 0:
+                    if lo_out != pdf_path:
+                        lo_out.rename(pdf_path)
+                    return {
+                        "status": "success",
+                        "converter": "libreoffice",
+                        "filename": out_filename,
+                        "path": str(pdf_path),
+                        "file_size_bytes": pdf_path.stat().st_size,
+                    }
+                else:
+                    raise RuntimeError(
+                        f"LibreOffice exited {proc.returncode}; stderr: {proc.stderr[:300]}"
+                    )
+            except Exception as exc:
+                logger.warning("LibreOffice conversion failed: %s", exc)
+
+        # ── Neither converter available ───────────────────────────────
+        raise RuntimeError(
+            "PDF conversion requires either docx2pdf (with Microsoft Word installed) "
+            "or LibreOffice (soffice/libreoffice in PATH). "
+            "Neither was found on this system."
+        )
+
+
+# ── 9. Multimodal OCR & Vision Inspector Tool ─────────────────────────────
 
 class VisionInspectorTool:
     """Tool wrapper for Member 3's MultimodalProcessor.
@@ -772,6 +1262,9 @@ class ToolExecutor:
         self.file_manager = SandboxedFileManager(self.sandbox_dir)
         self.python_runner = SubprocessPythonRunner(self.sandbox_dir)
         self.document_generator = DocumentGenerator(self.file_manager)
+        self.spreadsheet_generator = SpreadsheetGenerator(self.file_manager)
+        self.presentation_generator = PresentationGenerator(self.file_manager)
+        self.pdf_converter = PDFConverter(self.file_manager)
         self.vision_tool = VisionInspectorTool(self.sandbox_dir, DEFAULT_PROJECT_ROOT)
 
     def tool_contracts(self) -> Dict[str, Dict[str, Any]]:
@@ -928,10 +1421,14 @@ class ToolExecutor:
     def calculate(
         self, expression: str, variables: Optional[Dict[str, float]] = None
     ) -> Dict[str, Any]:
-        """Evaluate mathematical expression safely via SafeCalculator."""
+        """Evaluate mathematical expression safely via SafeCalculator.
+
+        Returns a dict that includes ``steps`` — an ordered list of intermediate
+        reduction strings showing the full working of the calculation.
+        """
         start_time = time.perf_counter()
         try:
-            val = self.calculator_tool.evaluate(expression, variables)
+            val, steps = self.calculator_tool.evaluate(expression, variables)
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             result = {
                 "status": "success",
@@ -939,13 +1436,14 @@ class ToolExecutor:
                 "variables": variables or {},
                 "result": val,
                 "formatted_result": f"{val:,.4f}",
+                "steps": steps,
             }
             self.audit_logger.log(
                 tool_name="calculator",
                 arguments={"expression": expression, "variables": variables},
                 execution_time_ms=elapsed_ms,
                 status="success",
-                result_summary=f"Result: {val}",
+                result_summary=f"Result: {val} | Steps: {len(steps)}",
             )
             return result
         except Exception as exc:
@@ -1037,18 +1535,137 @@ class ToolExecutor:
 
         # ── Step 2: Route to Designated Tool ──────────────────────────
         try:
-            if tool_name in ("xlsx_generator", "pptx_generator", "pdf_generator"):
-                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-                contract = DOCUMENT_TOOL_CONTRACTS[tool_name]
-                return ToolResult(
-                    tool_name=tool_name,
-                    status="capability_unavailable",
-                    output={"contract": contract},
-                    is_verified=False,
-                    execution_time_ms=elapsed_ms,
-                    error=(f"{contract['format'].upper()} generation is not implemented by Member 2; "
-                           "connect the owning module to this contract."),
-                )
+            if tool_name == "xlsx_generator":
+                try:
+                    wb_spec    = kwargs.get("workbook")
+                    xls_fname  = kwargs.get("filename", "report.xlsx")
+                    xls_meta   = kwargs.get("metadata")
+                    xls_out    = self.spreadsheet_generator.generate(
+                        workbook=wb_spec, filename=xls_fname, metadata=xls_meta
+                    )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="xlsx_generator",
+                        arguments={"filename": xls_fname},
+                        execution_time_ms=elapsed_ms,
+                        status="success",
+                        result_summary=f"Saved xlsx {xls_fname} ({xls_out['file_size_bytes']} bytes)",
+                    )
+                    return ToolResult(
+                        tool_name="xlsx_generator",
+                        status="success",
+                        output=xls_out,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="xlsx_generator",
+                        arguments={"filename": kwargs.get("filename", "")},
+                        execution_time_ms=elapsed_ms,
+                        status="error",
+                        result_summary=f"xlsx_generator error: {exc}",
+                    )
+                    return ToolResult(
+                        tool_name="xlsx_generator",
+                        status="error",
+                        output=None,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=str(exc),
+                    )
+
+            if tool_name == "pptx_generator":
+                try:
+                    pptx_title  = kwargs.get("title", "Engineering Report")
+                    pptx_slides = kwargs.get("slides")
+                    pptx_fname  = kwargs.get("filename", "report.pptx")
+                    pptx_meta   = kwargs.get("metadata")
+                    pptx_out    = self.presentation_generator.generate(
+                        title=pptx_title, slides=pptx_slides,
+                        filename=pptx_fname, metadata=pptx_meta
+                    )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="pptx_generator",
+                        arguments={"title": pptx_title, "filename": pptx_fname},
+                        execution_time_ms=elapsed_ms,
+                        status="success",
+                        result_summary=f"Saved pptx {pptx_fname} ({pptx_out['file_size_bytes']} bytes)",
+                    )
+                    return ToolResult(
+                        tool_name="pptx_generator",
+                        status="success",
+                        output=pptx_out,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="pptx_generator",
+                        arguments={"filename": kwargs.get("filename", "")},
+                        execution_time_ms=elapsed_ms,
+                        status="error",
+                        result_summary=f"pptx_generator error: {exc}",
+                    )
+                    return ToolResult(
+                        tool_name="pptx_generator",
+                        status="error",
+                        output=None,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=str(exc),
+                    )
+
+            if tool_name == "pdf_generator":
+                try:
+                    pdf_docx   = kwargs.get("docx_filename") or kwargs.get("filename", "report.docx")
+                    pdf_out_fn = kwargs.get("out_filename")
+                    pdf_out    = self.pdf_converter.convert(
+                        docx_filename=pdf_docx, out_filename=pdf_out_fn
+                    )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="pdf_generator",
+                        arguments={"docx_filename": pdf_docx, "out_filename": pdf_out_fn},
+                        execution_time_ms=elapsed_ms,
+                        status="success",
+                        result_summary=f"PDF saved {pdf_out['filename']} via {pdf_out['converter']} ({pdf_out['file_size_bytes']} bytes)",
+                    )
+                    return ToolResult(
+                        tool_name="pdf_generator",
+                        status="success",
+                        output=pdf_out,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    err_msg = str(exc)
+                    is_unavail = "Neither was found" in err_msg or "PDF conversion requires" in err_msg
+                    self.audit_logger.log(
+                        tool_name="pdf_generator",
+                        arguments={"docx_filename": kwargs.get("docx_filename", "")},
+                        execution_time_ms=elapsed_ms,
+                        status="capability_unavailable" if is_unavail else "error",
+                        result_summary=f"pdf_generator: {err_msg[:200]}",
+                    )
+                    return ToolResult(
+                        tool_name="pdf_generator",
+                        status="capability_unavailable" if is_unavail else "error",
+                        output=None,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=err_msg,
+                    )
             if tool_name == "calculator":
                 # For calculation tasks: evaluate expression with optional variables
                 expr = kwargs.get("expression")
@@ -1127,63 +1744,101 @@ class ToolExecutor:
             elif tool_name == "file_manager":
                 action = kwargs.get("action", "read")
                 file_arg = kwargs.get("filename", "")
-                if action == "read":
-                    content = self.file_manager.read(file_arg)
-                    out = {"content": content}
-                elif action == "write":
-                    content = kwargs.get("content", "")
-                    out = self.file_manager.write(file_arg, content, overwrite=kwargs.get("overwrite", True))
-                elif action == "list":
-                    out = {"files": self.file_manager.list_files(file_arg)}
-                elif action == "exists":
-                    out = {"exists": self.file_manager.exists(file_arg)}
-                else:
-                    raise ValueError(f"Unknown file_manager action: {action}")
+                try:
+                    if action == "read":
+                        content = self.file_manager.read(file_arg)
+                        out = {"content": content}
+                    elif action == "write":
+                        content = kwargs.get("content", "")
+                        out = self.file_manager.write(file_arg, content, overwrite=kwargs.get("overwrite", True))
+                    elif action == "list":
+                        out = {"files": self.file_manager.list_files(file_arg)}
+                    elif action == "exists":
+                        out = {"exists": self.file_manager.exists(file_arg)}
+                    else:
+                        raise ValueError(f"Unknown file_manager action: {action}")
 
-                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-                self.audit_logger.log(
-                    tool_name="file_manager",
-                    arguments={"action": action, "filename": file_arg},
-                    execution_time_ms=elapsed_ms,
-                    status="success",
-                    result_summary=f"Action {action} completed on {file_arg}",
-                )
-                return ToolResult(
-                    tool_name="file_manager",
-                    status="success",
-                    output=out,
-                    rag_context=rag_context,
-                    execution_time_ms=elapsed_ms,
-                    fallback_warning=fallback_warning,
-                )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="file_manager",
+                        arguments={"action": action, "filename": file_arg},
+                        execution_time_ms=elapsed_ms,
+                        status="success",
+                        result_summary=f"Action {action} completed on {file_arg}",
+                    )
+                    return ToolResult(
+                        tool_name="file_manager",
+                        status="success",
+                        output=out,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="file_manager",
+                        arguments={"action": action, "filename": file_arg},
+                        execution_time_ms=elapsed_ms,
+                        status="error",
+                        result_summary=f"file_manager {action} error on '{file_arg}': {exc}",
+                    )
+                    return ToolResult(
+                        tool_name="file_manager",
+                        status="error",
+                        output=None,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=str(exc),
+                    )
 
             elif tool_name == "document_generator":
                 title_text = kwargs.get("title", "Refinery Report")
                 sections_list = kwargs.get("sections", [])
                 doc_filename = kwargs.get("filename", "report.docx")
                 meta = kwargs.get("metadata")
-                doc_out = self.document_generator.generate_report(
-                    title=title_text,
-                    sections=sections_list,
-                    filename=doc_filename,
-                    metadata=meta,
-                )
-                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-                self.audit_logger.log(
-                    tool_name="document_generator",
-                    arguments={"title": title_text, "filename": doc_filename},
-                    execution_time_ms=elapsed_ms,
-                    status="success",
-                    result_summary=f"Saved docx {doc_filename} ({doc_out['file_size_bytes']} bytes)",
-                )
-                return ToolResult(
-                    tool_name="document_generator",
-                    status="success",
-                    output=doc_out,
-                    rag_context=rag_context,
-                    execution_time_ms=elapsed_ms,
-                    fallback_warning=fallback_warning,
-                )
+                try:
+                    doc_out = self.document_generator.generate_report(
+                        title=title_text,
+                        sections=sections_list,
+                        filename=doc_filename,
+                        metadata=meta,
+                    )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="document_generator",
+                        arguments={"title": title_text, "filename": doc_filename},
+                        execution_time_ms=elapsed_ms,
+                        status="success",
+                        result_summary=f"Saved docx {doc_filename} ({doc_out['file_size_bytes']} bytes)",
+                    )
+                    return ToolResult(
+                        tool_name="document_generator",
+                        status="success",
+                        output=doc_out,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="document_generator",
+                        arguments={"title": title_text, "filename": doc_filename},
+                        execution_time_ms=elapsed_ms,
+                        status="error",
+                        result_summary=f"document_generator error: {exc}",
+                    )
+                    return ToolResult(
+                        tool_name="document_generator",
+                        status="error",
+                        output=None,
+                        rag_context=rag_context,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=str(exc),
+                    )
 
             elif tool_name in ("vision_inspector", "ocr", "vision"):
                 file_arg = (
@@ -1194,39 +1849,71 @@ class ToolExecutor:
                 )
                 force_route = kwargs.get("force_route")
                 category = kwargs.get("document_category", "inspection_report")
-                inspect_out = self.vision_tool.inspect(
-                    file_path=file_arg,
-                    force_route=force_route,
-                    document_category=category,
-                    question=kwargs.get("question"),
-                    use_vlm=kwargs.get("use_vlm", isinstance(decision_or_tool, RoutingDecision) and decision_or_tool.capability == Capability.VISION),
-                )
-                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-                self.audit_logger.log(
-                    tool_name="vision_inspector",
-                    arguments={"filename": str(file_arg), "force_route": force_route},
-                    execution_time_ms=elapsed_ms,
-                    status=inspect_out["status"],
-                    result_summary=(
-                        f"Parsed {inspect_out['filename']} via {inspect_out['routing_decision']} "
-                        f"({len(inspect_out['text'])} chars extracted)"
-                    ),
-                )
-                return ToolResult(
-                    tool_name="vision_inspector",
-                    status=inspect_out["status"],
-                    output=inspect_out,
-                    rag_context=rag_context,
-                    is_verified=inspect_out["status"] in ("success", "warning"),
-                    execution_time_ms=elapsed_ms,
-                    fallback_warning=fallback_warning,
-                )
+                try:
+                    inspect_out = self.vision_tool.inspect(
+                        file_path=file_arg,
+                        force_route=force_route,
+                        document_category=category,
+                        question=kwargs.get("question"),
+                        use_vlm=kwargs.get("use_vlm", isinstance(decision_or_tool, RoutingDecision) and decision_or_tool.capability == Capability.VISION),
+                    )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="vision_inspector",
+                        arguments={"filename": str(file_arg), "force_route": force_route},
+                        execution_time_ms=elapsed_ms,
+                        status=inspect_out["status"],
+                        result_summary=(
+                            f"Parsed {inspect_out['filename']} via {inspect_out['routing_decision']} "
+                            f"({len(inspect_out['text'])} chars extracted)"
+                        ),
+                    )
+                    return ToolResult(
+                        tool_name="vision_inspector",
+                        status=inspect_out["status"],
+                        output=inspect_out,
+                        rag_context=rag_context,
+                        is_verified=inspect_out["status"] in ("success", "warning"),
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    self.audit_logger.log(
+                        tool_name="vision_inspector",
+                        arguments={"filename": str(file_arg), "force_route": force_route},
+                        execution_time_ms=elapsed_ms,
+                        status="error",
+                        result_summary=f"vision_inspector error on '{file_arg}': {exc}",
+                    )
+                    return ToolResult(
+                        tool_name="vision_inspector",
+                        status="error",
+                        output=None,
+                        rag_context=rag_context,
+                        is_verified=False,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=str(exc),
+                    )
 
             else:
                 raise ValueError(f"Unsupported tool name: {tool_name}")
 
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            # Top-level safety net: any unhandled exception from tool dispatch
+            # is logged to the audit trail before returning a structured error.
+            try:
+                self.audit_logger.log(
+                    tool_name=tool_name,
+                    arguments={"task": task[:200] if task else ""},
+                    execution_time_ms=elapsed_ms,
+                    status="error",
+                    result_summary=f"Unhandled exception in execute() for tool '{tool_name}': {exc}",
+                )
+            except Exception:
+                pass  # audit failure must never mask the original error
             return ToolResult(
                 tool_name=tool_name,
                 status="error",
