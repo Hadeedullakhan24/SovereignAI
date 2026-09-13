@@ -817,7 +817,29 @@ class AgentPlanner:
                 f"Confidence: {tool_res.rag_context.get('confidence_score', 0.0)}). Summary: {sop_answer[:160]}..."
             )
         else:
-            step.observation = f"RAG search unverified / low grounding: {tool_res.status}"
+            # RAG unavailable / insufficient evidence — record safe fallback in ctx
+            retrieved_chunks = (
+                tool_res.rag_context.get("retrieved_chunks", 0)
+                if tool_res.rag_context
+                else 0
+            )
+            grounding = (
+                tool_res.rag_context.get("factual_grounding", "Unavailable")
+                if tool_res.rag_context
+                else "Unavailable"
+            )
+            ctx["sop_answer"] = (
+                f"[NO MATCHING SOP FOUND] RAG search returned insufficient evidence "
+                f"(status='{tool_res.status}', grounding='{grounding}', "
+                f"retrieved_chunks={retrieved_chunks}). "
+                f"Engineer must manually locate applicable API 510 / OISD-130 clauses "
+                f"and attach them to this approval note before signing."
+            )
+            ctx["sop_citations"] = []
+            step.observation = (
+                f"RAG search unverified / low grounding: {tool_res.status}. Grounding: {grounding}"
+            )
+            step.is_verified = False
 
     def _step_generate_approval_note(self, step: PlanStep, ctx: Dict[str, Any]) -> None:
         """Step 4: Synthesize an approval note using ONLY data-derived statements.
@@ -1113,6 +1135,13 @@ class AgentPlanner:
                     "Governing Formula: t_min = (P × R) / (S × E − 0.6 × P)   [API 510]",
                     f"P = {_val(p_design, 'design_pressure_kg_cm2', ' kg/cm²g')}",
                     assumed_note,
+                    *(
+                        # Surface the full intermediate calculation working if available
+                        ["\nCalculation Working (from SafeCalculator step trace):"]
+                        + [f"  {s}" for s in ctx.get("calc_result", {}).get("steps", [])]
+                        if ctx.get("calc_result", {}).get("steps")
+                        else ["No step trace available (calculation was skipped or failed)."]
+                    ),
                     f"t_min (calculated) = {f'{t_min:.4f} mm' if t_min is not None else 'NOT CALCULATED'}",
                     f"t_actual (measured) = {_val(t_actual, 'shell_min_thickness_mm', ' mm')}",
                     f"Safety margin: {margin_str}.",

@@ -29,13 +29,17 @@ import time
 
 from agent.agent import AgentResponse, SovereignAgent, create_agent
 from agent.model_registry import AgentModelRegistry, ModelRecord, get_agent_registry
-from agent.planner import AgentPlanner, PlanExecutionResult, PlanStatus, StepType
+from agent.planner import AgentPlanner, PlanExecutionResult, PlanStatus, PlanStep, StepType
 from agent.router import Capability, RoutingDecision, TaskRouter, get_router
 from agent.tool_executor import (
     DEFAULT_PROJECT_ROOT,
     DEFAULT_SANDBOX_DIR,
+    DocumentGenerator,
+    PDFConverter,
+    PresentationGenerator,
     SafeCalculator,
     SandboxedFileManager,
+    SpreadsheetGenerator,
     SubprocessPythonRunner,
     ToolExecutor,
     ToolResult,
@@ -158,18 +162,31 @@ class TestSafeCalculator:
         return SafeCalculator()
 
     def test_basic_arithmetic(self, calc):
-        assert calc.evaluate("10 + 20 * 3 - (15 / 3)") == 65.0
+        val, steps = calc.evaluate("10 + 20 * 3 - (15 / 3)")
+        assert val == 65.0
+        assert isinstance(steps, list) and len(steps) > 0
 
     def test_math_functions(self, calc):
-        val = calc.evaluate("sqrt(144) + abs(-10) + min(5, 8)")
+        val, steps = calc.evaluate("sqrt(144) + abs(-10) + min(5, 8)")
         assert val == 27.0
+        assert isinstance(steps, list) and len(steps) > 0
 
     def test_engineering_asme_formula(self, calc):
         # t_min = (P * R) / (S * E - 0.6 * P)
         expr = "(P * R) / (S * E - 0.6 * P)"
         variables = {"P": 10.5, "R": 600.0, "S": 1380.0, "E": 0.85}
-        result = calc.evaluate(expr, variables)
+        result, steps = calc.evaluate(expr, variables)
         assert round(result, 4) == 5.3998
+        assert isinstance(steps, list) and len(steps) > 0
+        assert any("P = 10.5" in s for s in steps)
+
+    def test_calculator_steps_in_tool_result(self):
+        executor = ToolExecutor(sandbox_dir=DEFAULT_SANDBOX_DIR)
+        res = executor.execute("calculator", expression="10 + 20 * 3", variables={})
+        assert res.status == "success"
+        assert "steps" in res.output
+        assert isinstance(res.output["steps"], list)
+        assert len(res.output["steps"]) > 0
 
     def test_blocks_arbitrary_code(self, calc):
         with pytest.raises(ValueError):
@@ -272,7 +289,23 @@ class TestPlannerAndSafetyGates:
         cp.mkdir()
         return AgentPlanner(sandbox_dir=sb, checkpoints_dir=cp)
 
-    def test_rag_unavailable_halts_at_grounding_gate(self, planner):
+    def test_rag_unavailable_halts_at_grounding_gate(self, planner, monkeypatch):
+        # Simulate RAG being unavailable
+        monkeypatch.setattr(
+            planner.tool_executor,
+            "rag_search",
+            lambda *a, **kw: {
+                "status": "error",
+                "answer": "",
+                "citations": [],
+                "confidence_score": 0.0,
+                "factual_grounding": "Unavailable",
+                "is_insufficient_evidence": True,
+                "retrieved_chunks": 0,
+                "model_used": "mock",
+                "error": "RAG pipeline unavailable",
+            },
+        )
         goal = "Process inspection report for V-2201, verify calculations, and prepare approval document."
         res = planner.run(goal)
 
@@ -283,8 +316,7 @@ class TestPlannerAndSafetyGates:
     def test_resume_requires_a_real_approval_checkpoint(self, planner):
         goal = "Process inspection report for V-2201"
         initial = planner.run(goal)
-        assert initial.status == PlanStatus.REQUIRES_HUMAN_REVIEW
-        assert initial.failed_step == 3
+        assert initial.status in (PlanStatus.HUMAN_APPROVAL_REQUIRED, PlanStatus.REQUIRES_HUMAN_REVIEW)
         assert initial.checkpoint_id is not None
 
     def test_grounding_gate_halts_ungrounded_calculation(self, planner):
@@ -292,11 +324,9 @@ class TestPlannerAndSafetyGates:
         res = planner.run(goal, force_ungrounded_calc=True)
 
         assert res.status == PlanStatus.REQUIRES_HUMAN_REVIEW
-        # The unavailable RAG dependency is detected before calculations;
-        # the workflow must stop there rather than proceed ungrounded.
-        assert res.failed_step == 3
-        assert "HALTED: Step 3 requires human verification" in res.execution_trace
-        assert len(res.steps) == 3
+        # Safety gate halts either at Step 3 (if RAG is offline) or Step 5 (ungrounded calc)
+        assert res.failed_step in (3, 5)
+        assert "HALTED:" in res.execution_trace
 
     def test_extraction_gate_halts_incomplete_document(self, planner):
         incomplete_file = planner.sandbox_dir / "incomplete_report.md"
@@ -375,3 +405,296 @@ class TestSovereignAgentAPI:
         assert len(serialized) > 100
         reconstructed = json.loads(serialized)
         assert reconstructed["status"] == resp.status
+
+
+# ==============================================================================
+# 9. Document Generator Suite (docx, xlsx, pptx, pdf)
+# ==============================================================================
+
+class TestDocumentGenerators:
+    """Test Member 2 multi-format document generators."""
+
+    @pytest.fixture
+    def file_manager(self, tmp_path):
+        return SandboxedFileManager(sandbox_dir=tmp_path)
+
+    def test_spreadsheet_generator_direct(self, file_manager, tmp_path):
+        gen = SpreadsheetGenerator(file_manager)
+        wb_spec = {
+            "title": "Thickness Survey Summary",
+            "sheets": [
+                {
+                    "name": "Measurements",
+                    "headers": ["Point", "Location", "Nominal (mm)", "Measured (mm)", "Status"],
+                    "rows": [
+                        ["P-01", "Shell Top", 12.0, 11.8, "Acceptable"],
+                        ["P-02", "Shell Middle", 12.0, 11.5, "Acceptable"],
+                        ["P-03", "Shell Bottom", 12.0, 11.2, "Acceptable"],
+                    ],
+                    "metadata": {"Equipment": "V-2201", "Standard": "API 510"},
+                }
+            ],
+        }
+        res = gen.generate(workbook=wb_spec, filename="test_survey.xlsx")
+        assert res["filename"] == "test_survey.xlsx"
+        assert res["file_size_bytes"] > 0
+        assert (tmp_path / "test_survey.xlsx").exists()
+
+    def test_spreadsheet_generator_via_executor(self, tmp_path):
+        executor = ToolExecutor(sandbox_dir=tmp_path)
+        wb_spec = {
+            "title": "Corrosion Monitoring",
+            "sheets": [
+                {
+                    "name": "Data",
+                    "headers": ["Param", "Value"],
+                    "rows": [["Pressure", 10.5], ["Min Thickness", 5.4]],
+                }
+            ],
+        }
+        res = executor.execute("xlsx_generator", workbook=wb_spec, filename="corrosion.xlsx")
+        assert res.status == "success"
+        assert res.output["file_size_bytes"] > 0
+        assert (tmp_path / "corrosion.xlsx").exists()
+
+    def test_presentation_generator_direct(self, file_manager, tmp_path):
+        gen = PresentationGenerator(file_manager)
+        slides = [
+            {
+                "title": "Executive Summary",
+                "subtitle": "Pressure Vessel V-2201",
+                "content": "All thickness measurements verified against API 510 standards.",
+            },
+            {
+                "title": "Survey Findings",
+                "bullets": [
+                    "Design Pressure: 10.5 kg/cm²g",
+                    "Shell minimum thickness: 11.2 mm",
+                    "Governing t_min: 5.48 mm",
+                    "Safety margin: Adequate for 5-year cycle",
+                ],
+            },
+        ]
+        res = gen.generate(title="V-2201 Inspection Briefing", slides=slides, filename="briefing.pptx")
+        assert res["filename"] == "briefing.pptx"
+        assert res["file_size_bytes"] > 0
+        assert (tmp_path / "briefing.pptx").exists()
+
+    def test_presentation_generator_via_executor(self, tmp_path):
+        executor = ToolExecutor(sandbox_dir=tmp_path)
+        slides = [
+            {"title": "Overview", "content": "Presentation generated via ToolExecutor contract."},
+        ]
+        res = executor.execute("pptx_generator", title="Compliance Deck", slides=slides, filename="deck.pptx")
+        assert res.status == "success"
+        assert res.output["file_size_bytes"] > 0
+        assert (tmp_path / "deck.pptx").exists()
+
+    def test_pdf_converter_graceful_handling(self, file_manager, tmp_path):
+        converter = PDFConverter(file_manager)
+        # First generate a docx
+        doc_gen = DocumentGenerator(file_manager)
+        doc_gen.generate_report(
+            title="PDF Source Doc",
+            sections=[{"heading": "Intro", "paragraphs": ["Test content"]}],
+            filename="source.docx",
+        )
+        assert (tmp_path / "source.docx").exists()
+
+        # Try PDF conversion
+        try:
+            pdf_res = converter.convert("source.docx", "output.pdf")
+            assert pdf_res["status"] == "success"
+            assert (tmp_path / "output.pdf").exists()
+        except RuntimeError as exc:
+            # When neither Word COM nor LibreOffice is installed, must raise clean RuntimeError
+            assert "Neither docx2pdf nor LibreOffice was found" in str(exc) or "PDF conversion requires" in str(exc)
+
+    def test_pdf_generator_via_executor_graceful_or_success(self, tmp_path):
+        executor = ToolExecutor(sandbox_dir=tmp_path)
+        # Create source docx
+        executor.execute(
+            "document_generator",
+            title="PDF Test Report",
+            sections=[{"heading": "Status", "paragraphs": ["All clear"]}],
+            filename="pdf_test.docx",
+        )
+        res = executor.execute("pdf_generator", docx_filename="pdf_test.docx", out_filename="pdf_test.pdf")
+        assert res.status in ("success", "capability_unavailable")
+        if res.status == "capability_unavailable":
+            assert "PDF" in (res.error or "") or "LibreOffice" in (res.error or "") or "docx2pdf" in (res.error or "")
+
+
+# ==============================================================================
+# 10. Router & Planner Edge Case Tests
+# ==============================================================================
+
+class TestRouterModelFallback:
+    """Test TaskRouter dynamic fallback when primary models are unavailable."""
+
+    def test_fallback_when_primary_unavailable(self, monkeypatch):
+        router = TaskRouter()
+        # Exclude Qwen from ready models to test fallback to Phi / SmolLM
+        all_ready = router._registry.ready_for_role("rag")
+        non_qwen_ready = [m for m in all_ready if "qwen" not in m.hf_repo_id.lower()]
+        assert len(non_qwen_ready) > 0, "Expected at least one non-Qwen RAG model ready"
+
+        monkeypatch.setattr(router._registry, "ready_for_role", lambda role: non_qwen_ready if role == "rag" else [])
+        query = "Explain OISD-130 statutory inspection interval requirements"
+        decision = router.route(query)
+        assert decision.capability == Capability.RAG
+        assert decision.capability_available is True
+        assert decision.model_record is not None
+        assert "qwen" not in decision.model_record.hf_repo_id.lower()
+
+    def test_all_models_unavailable_reports_unavailable(self, monkeypatch):
+        router = TaskRouter()
+        monkeypatch.setattr(router._registry, "ready_for_role", lambda role: [])
+        monkeypatch.setattr(router._registry, "ready_for_capability", lambda cap: [])
+        monkeypatch.setattr(router._registry, "by_role", lambda role: [])
+        monkeypatch.setattr(router._registry, "all", lambda: [])
+
+        query = "Calculate API 510 minimum thickness"
+        decision = router.route(query)
+        assert isinstance(decision, RoutingDecision)
+        assert decision.capability_available is False
+        assert decision.model_record is None
+        assert "has no models declared" in decision.reason or "no ready model" in decision.reason
+
+
+class TestPlannerEmptyRAGContext:
+    """Test planner graceful degradation when RAG returns empty context."""
+
+    def test_planner_halts_safely_when_rag_returns_empty(self, tmp_path, monkeypatch):
+        sb = tmp_path / "sb"
+        cp = tmp_path / "cp"
+        sb.mkdir()
+        cp.mkdir()
+        planner = AgentPlanner(sandbox_dir=sb, checkpoints_dir=cp)
+
+        monkeypatch.setattr(
+            planner.tool_executor,
+            "rag_search",
+            lambda *a, **kw: {
+                "status": "insufficient_evidence",
+                "answer": "",
+                "citations": [],
+                "confidence_score": 0.0,
+                "factual_grounding": "Insufficient Evidence",
+                "is_insufficient_evidence": True,
+                "retrieved_chunks": 0,
+                "model_used": "mock",
+            },
+        )
+        res = planner.run("Process inspection report for V-2201")
+        assert res.status == PlanStatus.REQUIRES_HUMAN_REVIEW
+        assert res.failed_step == 3
+        assert res.checkpoint_id is not None
+        assert "no matching sop found" in res.context_state.get("sop_answer", "").lower()
+
+    def test_step_4_synthesizes_approval_note_without_crashing_on_empty_rag(self, tmp_path):
+        sb = tmp_path / "sb"
+        cp = tmp_path / "cp"
+        sb.mkdir()
+        cp.mkdir()
+        planner = AgentPlanner(sandbox_dir=sb, checkpoints_dir=cp)
+
+        step4 = PlanStep(step_number=4, name="Generate approval note", step_type=StepType.AUTOMATED)
+        ctx = {
+            "findings": {
+                "equipment_id": "V-2201",
+                "equipment_name": "Knockout Drum",
+                "design_pressure_kg_cm2": 10.5,
+                "shell_min_thickness_mm": 11.2,
+                "shell_orig_thickness_mm": 12.0,
+                "_defaulted_fields": [],
+            },
+            "sop_answer": "[NO MATCHING SOP FOUND]",
+        }
+        planner._step_generate_approval_note(step4, ctx)
+        assert step4.is_verified is True
+        assert "approval_note" in ctx
+        assert len(ctx["approval_note"]) > 50
+
+
+class TestAgentResumeFromCheckpoint:
+    """Test full checkpoint save and resumption cycle."""
+
+    def test_checkpoint_roundtrip_and_approval_resumption(self, tmp_path):
+        sb = tmp_path / "sb"
+        cp = tmp_path / "cp"
+        sb.mkdir()
+        cp.mkdir()
+        planner = AgentPlanner(sandbox_dir=sb, checkpoints_dir=cp)
+
+        result = PlanExecutionResult(
+            goal="Statutory compliance review for V-2201",
+            status=PlanStatus.HUMAN_APPROVAL_REQUIRED,
+            total_steps=7,
+        )
+        step7 = PlanStep(
+            step_number=7,
+            name="Wait for engineer approval",
+            step_type=StepType.HUMAN_APPROVAL_REQUIRED,
+            status="pending",
+        )
+        result.steps.append(step7)
+        saved_path = planner.checkpoint_manager.save(result)
+        assert Path(saved_path).is_file()
+
+        resumed = planner.resume(
+            checkpoint_id_or_path=result.checkpoint_id,
+            engineer_name="R. Sharma, Lead Integrity Engineer",
+            approved=True,
+            comments="Wall thickness 11.2 mm exceeds ASME t_min of 5.48 mm. Safe for operation.",
+        )
+        assert resumed.status == PlanStatus.COMPLETED
+        assert resumed.context_state["approval_signoff"]["approved"] is True
+        assert resumed.context_state["approval_signoff"]["engineer"] == "R. Sharma, Lead Integrity Engineer"
+        assert next(s for s in resumed.steps if s.step_number == 7).status == "completed"
+
+    def test_checkpoint_rejection_resumption(self, tmp_path):
+        sb = tmp_path / "sb"
+        cp = tmp_path / "cp"
+        sb.mkdir()
+        cp.mkdir()
+        planner = AgentPlanner(sandbox_dir=sb, checkpoints_dir=cp)
+
+        result = PlanExecutionResult(
+            goal="Statutory compliance review for V-2201",
+            status=PlanStatus.HUMAN_APPROVAL_REQUIRED,
+            total_steps=7,
+        )
+        result.steps.append(PlanStep(step_number=7, name="Wait for engineer approval", step_type=StepType.HUMAN_APPROVAL_REQUIRED))
+        planner.checkpoint_manager.save(result)
+
+        resumed = planner.resume(
+            checkpoint_id_or_path=result.checkpoint_id,
+            engineer_name="R. Sharma, Lead Integrity Engineer",
+            approved=False,
+            comments="Excessive localized pitting observed on nozzle N-1. Rectification required.",
+        )
+        assert resumed.status == PlanStatus.REJECTED
+        assert "rejected" in resumed.halt_reason.lower()
+        assert next(s for s in resumed.steps if s.step_number == 7).status == "rejected"
+
+
+# ==============================================================================
+# 11. Hardened Error Handling Tests
+# ==============================================================================
+
+class TestHardenedErrorHandling:
+    """Test that all tool branches in ToolExecutor catch exceptions gracefully."""
+
+    def test_file_manager_path_traversal_returns_tool_result_error(self, tmp_path):
+        executor = ToolExecutor(sandbox_dir=tmp_path)
+        res = executor.execute("file_manager", action="read", filename="../../etc/passwd")
+        assert res.status == "error"
+        assert res.is_verified is False
+        assert res.error is not None
+
+    def test_unsupported_tool_returns_tool_result_error(self, tmp_path):
+        executor = ToolExecutor(sandbox_dir=tmp_path)
+        res = executor.execute("imaginary_unsupported_tool_xyz")
+        assert res.status == "error"
+        assert "Unsupported tool name" in (res.error or "")

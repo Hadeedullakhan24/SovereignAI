@@ -260,6 +260,11 @@ class TaskRouter:
     def __init__(self, registry: Optional[AgentModelRegistry] = None) -> None:
         self._registry = registry or get_agent_registry()
 
+    @property
+    def model_registry(self) -> AgentModelRegistry:
+        """The underlying AgentModelRegistry instance."""
+        return self._registry
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
