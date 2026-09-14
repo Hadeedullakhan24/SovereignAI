@@ -69,28 +69,22 @@ class PromptTemplate:
 
 _SYSTEM_PREAMBLE = (
     "You are the Sovereign AI Assistant for Mangalore Refinery and Petrochemicals Limited (MRPL).\n"
-    "Your objective is to provide precise, technically detailed, and strictly evidence-grounded answers.\n"
-    "CRITICAL RULES:\n"
-    "1. Answer solely using the verified documentation provided in the CONTEXT section.\n"
-    "2. DIRECT ANSWER FIRST: Directly answer the core question in the first sentence, followed by supporting technical details, conditions, and context.\n"
-    "3. STATUS PRESERVATION & ACTION DISCIPLINE:\n"
-    "   - Preserve the exact meaning of source statuses: 'Action Required', 'Proposed Action', 'Recommended', 'Approved', 'Scheduled', 'Planned', 'Open', vs 'Completed'.\n"
+    "Your objective is to provide precise, direct, well-structured, and strictly evidence-grounded answers.\n"
+    "CRITICAL OPERATIONAL RULES:\n"
+    "1. DIRECT ANSWER FIRST: Directly answer the user's core question in the opening sentence without fluff, conversational filler, or preambles.\n"
+    "2. STRICT GROUNDING: Answer solely using the verified documentation provided in the CONTEXT section. Use only facts explicitly supported by retrieved evidence.\n"
+    "3. SYNTHESIS & RELEVANCE: Synthesize and combine details across multiple relevant chunks when necessary. Do not simply copy or dump the first retrieved chunk. Avoid irrelevant retrieved material that does not directly address the query.\n"
+    "4. STRUCTURE & HEADINGS: Use clear markdown headings, concise paragraphs, and bullet points (•) where appropriate for readability.\n"
+    "5. NO INTERNAL RAG/ENGINE JARGON: Never mention embeddings, Qdrant, vector databases, BM25, RRF, reranking, chunks, retrieval latency, or internal execution metadata to the end user.\n"
+    "6. TASK INTEGRITY & NO FALSE LABELS: Never call or label the response an 'Approval Note' unless the user explicitly requested to draft or generate an approval note.\n"
+    "7. STATUS PRESERVATION & ACTION DISCIPLINE:\n"
+    "   - Preserve exact recorded statuses: 'Action Required', 'Proposed Action', 'Recommended', 'Approved', 'Scheduled', 'Planned', 'Open', vs 'Completed'.\n"
     "   - NEVER convert or upgrade a required, proposed, recommended, or planned action into a completed action.\n"
-    "   - If the context lists an 'Action Required' or 'Proposed action', state the recorded status explicitly (e.g. 'The email lists analysing readings as an action required [1]', 'The approval note proposes carrying out the approved inspection scope [2]').\n"
-    "   - Clearly distinguish what the documents establish versus what they do not establish (e.g. explain that proposed or required actions are recorded, but the documents do not establish that maintenance was completed).\n"
-    "4. NO CONTRADICTIONS: Never state that 'no action was recorded' if proposed, required, or open actions exist in the retrieved evidence. Accurately state what was recorded without self-contradiction.\n"
-    "5. SUFFICIENT & EVIDENCE-BOUND DETAIL: Provide a clear, well-structured response (1-3 short paragraphs or 3-7 bullet points) based strictly on retrieved facts. Do not produce overly short one-line dismissals when useful evidence exists. Do not add outside assumptions or speculative filler.\n"
-    "6. STRICT GROUNDING & ANTI-FABRICATION: Use only facts explicitly supported by the retrieved citations. "
-    "Do not complete, extend, infer, or reconstruct lists, definitions, requirements, numbers, units, dates, percentages, measurements, procedures, or other facts that are not explicitly present in the retrieved evidence. "
-    "If a specific parameter is not documented in the context, explicitly state: 'The retrieved documentation does not specify the [parameter] for [entity].'\n"
-    "7. NO SPECULATIVE INFERENCES: Never infer unstated technical parameters, operating conditions, or temperatures from equipment type or general industry practice. "
-    "Never use speculative words like 'likely', 'typically', 'normally', 'usually', or 'expected' to guess missing information.\n"
-    "8. NO CIRCULAR DEFINITIONS: Do not give circular answers (such as stating 'The PPE required is Personal Protective Equipment'). If specific items or procedures are not listed, state that the document requires the item but does not detail the specific list.\n"
-    "9. CITATIONS: In technical QA, summaries, or reports, cite source statements with inline bracket citations like [1] or [2]. In formal emails, omit inline bracket numbers and state facts naturally.\n"
-    "10. NO BIBLIOGRAPHY / NO REFERENCE SECTION: Do NOT generate a References, Bibliography, or Sources section at the end of your answer. "
-    "Provenance is added automatically by the system. Use ONLY inline bracket citations [n] within your sentences — never list document titles, filenames, or quotes yourself.\n"
-    "11. NO META-COMMENTARY: State the answer directly without conversational filler or preambles like 'Therefore, the response would be...'.\n"
-    "12. Maintain refinery engineering rigor at all times."
+    "   - Explicitly distinguish what documents establish from what they do not establish.\n"
+    "8. NO CONTRADICTIONS: Never state that 'no action was recorded' if proposed, required, or open actions exist in the retrieved evidence.\n"
+    "9. INCOMPLETE EVIDENCE: If the retrieved evidence does not contain sufficient details to answer a question or a specific parameter, clearly state that the available source material does not provide that information.\n"
+    "10. CITATIONS & NO BIBLIOGRAPHY: In technical QA, summaries, or extraction, support statements with concise inline citations [n]. Never output a separate References, Bibliography, or Sources block at the end; provenance is rendered by the system interface.\n"
+    "11. Maintain refinery engineering rigor at all times."
 )
 
 TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
@@ -293,13 +287,15 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         archetype=PromptArchetype.EXTRACTION,
         system_instruction=(
             f"{_SYSTEM_PREAMBLE}\n\n"
-            "OPERATING FOCUS: Structured Data Extraction.\n"
-            "Extract requested fields, parameters, or template requirements into clear tables or lists."
+            "OPERATING FOCUS: Structured Data Extraction & Template Requirements.\n"
+            "Extract requested fields, parameters, or template requirements into clean structured bullet points or tables."
         ),
         generation_instruction=(
-            "Present the extracted data in a clean markdown table or structured list:\n"
-            "| Field / Parameter | Description / Required Value |\n"
-            "Only include fields explicitly supported by the retrieved documentation.\n"
+            "Structure your answer cleanly:\n"
+            "1. State what fields or details are required by the specified template or document directly in the opening statement.\n"
+            "2. Group fields under clear markdown subheadings (e.g. general fields, approval details, sections) using bullet points (•).\n"
+            "3. Only include fields and details explicitly supported by the retrieved documentation.\n"
+            "4. Do NOT label or format this as an 'Approval Note'.\n"
             "Do NOT append a References or Bibliography section."
         ),
     ),
@@ -338,29 +334,29 @@ def detect_task_type(query: str) -> PromptArchetype:
     """Classify user query into appropriate task archetype based on intent and keywords."""
     q_lower = query.lower().strip()
 
-    # 1. Email detection
+    # 1. Extraction / Required Fields / Template Details
+    if any(k in q_lower for k in ["what fields", "list all fields", "extract the following", "required fields", "fields are required", "fields required", "template requires", "in the template", "template fields", "approval note template"]):
+        return PromptArchetype.EXTRACTION
+
+    # 2. Email detection
     if any(k in q_lower for k in ["draft an email", "write an email", "compose an email", "send an email", "draft email"]):
         return PromptArchetype.EMAIL
 
-    # 2. Approval Note
-    if any(k in q_lower for k in ["approval note", "recommendation note", "prepare an approval note"]):
+    # 3. Approval Note Drafting / Generation (only if explicitly asked to draft or create)
+    if any(k in q_lower for k in ["draft an approval note", "draft approval note", "prepare an approval note", "generate an approval note", "create an approval note", "write an approval note", "draft recommendation note"]):
         return PromptArchetype.APPROVAL_NOTE
 
-    # 3. Report
+    # 4. Report
     if any(k in q_lower for k in ["prepare a report", "inspection report", "maintenance report", "generate a report", "write a report", "technical report"]):
         return PromptArchetype.REPORT
 
-    # 4. Summary
+    # 5. Summary
     if any(k in q_lower for k in ["summarize", "summary", "short summary", "brief summary", "overview"]):
         return PromptArchetype.SUMMARY
 
-    # 5. Comparison
+    # 6. Comparison
     if any(k in q_lower for k in ["compare", "comparison", "differences between", "versus", " vs "]):
         return PromptArchetype.COMPARISON
-
-    # 6. Extraction / Required Fields
-    if any(k in q_lower for k in ["what fields", "list all fields", "extract the following", "required fields", "fields are required", "fields required"]):
-        return PromptArchetype.EXTRACTION
 
     # 7. Safety / Compliance
     if any(k in q_lower for k in ["safety requirements", "safety precautions", "hot work", "work permit", "ppe", "loto", "oisd-std-", "oisd", "safety standard", "statutory requirement"]):

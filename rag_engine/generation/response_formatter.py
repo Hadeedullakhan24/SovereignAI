@@ -46,6 +46,59 @@ class ResponseFormatter:
         return "\n".join(lines)
 
     @staticmethod
+    def format_concise_sources(
+        citations: Sequence[CitationBundle],
+        query: str = "",
+        answer: str = "",
+        max_sources: int = 5,
+    ) -> str:
+        """Format clean, human-readable sources list (e.g., '### Sources\\n[1] Approval Note — Page 1')."""
+        if not citations:
+            return ""
+
+        # Check if citations [1], [2] are referenced in the answer text
+        referenced_ids = set(re.findall(r"\[(\d+)\]", answer))
+
+        selected: list[CitationBundle] = []
+        if referenced_ids:
+            for c in citations:
+                cit_id = getattr(c, "citation_id", "").strip("[]")
+                if cit_id in referenced_ids:
+                    selected.append(c)
+
+        if not selected:
+            q_lower = query.lower() if query else ""
+            for c in citations:
+                doc = (getattr(c, "document_name", None) or getattr(c, "document_id", "")).lower()
+                if "approval note" in q_lower and "approval" not in doc:
+                    continue
+                selected.append(c)
+
+        if not selected:
+            selected = list(citations[:max_sources])
+        else:
+            selected = selected[:max_sources]
+
+        lines: list[str] = ["### Sources"]
+        for idx, bundle in enumerate(selected, start=1):
+            anchor = getattr(bundle, "citation_id", f"[{idx}]")
+            if not anchor.startswith("["):
+                anchor = f"[{anchor}]"
+            raw_doc = getattr(bundle, "document_name", None) or getattr(bundle, "document_id", "Document")
+
+            # Clean document title
+            clean_doc = raw_doc
+            if clean_doc.endswith((".pdf", ".md", ".docx", ".txt")):
+                clean_doc = clean_doc.rsplit(".", 1)[0].replace("_", " ").title()
+            elif clean_doc.isupper():
+                clean_doc = clean_doc.title()
+
+            page = bundle.page_number if getattr(bundle, "page_number", None) else 1
+            lines.append(f"{anchor} {clean_doc} — Page {page}")
+
+        return "\n".join(lines)
+
+    @staticmethod
     def strip_provenance(text: str) -> str:
         """Strip existing reference or provenance headers from raw answer text."""
         cleaned = re.split(

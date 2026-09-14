@@ -123,10 +123,23 @@ class RAGResponse:
                 srcs.append(name)
         return srcs
 
-    def format_cli_output(self) -> str:
-        """Render a clean, human-readable terminal output adhering strictly to:
-        USER RESULT FIRST -> EVIDENCE SECOND -> TECHNICAL DETAILS LAST.
-        """
+    def format_clean_cli_output(self) -> str:
+        """Render clean, human-readable terminal output adhering to modern conversational interface."""
+        clean_ans = ResponseFormatter.strip_provenance(self.answer).strip()
+        concise_sources = ResponseFormatter.format_concise_sources(
+            self.citations,
+            query=self.query,
+            answer=clean_ans,
+        )
+        if concise_sources:
+            return f"{clean_ans}\n\n{concise_sources}"
+        return clean_ans
+
+    def format_cli_output(self, detailed: bool = True) -> str:
+        """Render terminal output. If detailed=True, adheres to 3-section format; otherwise returns clean output."""
+        if not detailed:
+            return self.format_clean_cli_output()
+
         detected = detect_task_type(self.query)
         header_map = {
             PromptArchetype.EMAIL: "GENERATED EMAIL",
@@ -471,12 +484,17 @@ class RAGPipeline:
         top_k: int = 5,
     ) -> tuple[RetrievalResult, Iterator[str]]:
         """Stream RAG response tokens after performing retrieval."""
+        effective_archetype = (
+            detect_task_type(query)
+            if archetype in (PromptArchetype.GENERAL_QA, "general_qa")
+            else archetype
+        )
         retrieval_result = self.retrieval.retrieve(query=query, top_k=top_k)
         stream = self.generation.stream_generate(
             query=query,
             retrieval_result=retrieval_result,
             session_id=session_id,
-            archetype=archetype,
+            archetype=effective_archetype,
         )
         return retrieval_result, stream
 

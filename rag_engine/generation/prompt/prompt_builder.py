@@ -114,6 +114,8 @@ class PromptBuilder(BasePromptBuilder):
                 "- NO CONTRADICTIONS: Do not state 'no action was recorded' if proposed, required, or open actions exist. Clearly explain what the documents establish versus what they do not establish.\n"
                 "- SUFFICIENT & EVIDENCE-BOUND DETAIL: Provide clear paragraphs, bullet points, or tables strictly grounded in the retrieved citations. Quote exact parameters, limits, and status designations.\n"
                 "- If a specific parameter or detail is not documented in the context, explicitly state: 'The retrieved documentation does not specify the [parameter] for [entity].'\n"
+                "- NO INTERNAL JARGON: Never mention embeddings, Qdrant, vector databases, BM25, RRF, reranking, chunks, retrieval latency, or internal system metadata.\n"
+                "- NO FALSE LABELS: Never call or label the response an 'Approval Note' unless the user specifically asked to generate or draft an approval note.\n"
                 "- NO META-COMMENTARY: State the findings directly without conversational filler or preambles (e.g. do not say 'Therefore, the response would be...').\n"
                 "- Do NOT generate a References, Bibliography, Sources, or Source(s) section at the end of your answer. Provenance is added automatically.\n\n"
                 "ASSISTANT: "

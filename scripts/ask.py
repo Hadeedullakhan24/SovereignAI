@@ -16,6 +16,15 @@ import logging
 from pathlib import Path
 import sys
 import time
+import warnings
+
+# Suppress ONLY the expected Qdrant local mode collection capacity warning at the CLI layer.
+# This must be executed before any RAG or Qdrant initialization occurs.
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r".*Local mode is not recommended for collections with more than 20,000 points.*",
+)
 
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -30,6 +39,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from rag_engine.generation.generation_config import GenerationConfig
 from rag_engine.generation.models.model_registry import LLMRegistry
 from rag_engine.generation.prompt.prompt_templates import PromptArchetype
+from rag_engine.generation.response_formatter import ResponseFormatter
 from rag_engine.pipeline.rag_pipeline import RAGPipeline, RAGResponse
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -37,12 +47,9 @@ logger = logging.getLogger("mrpl_ask_cli")
 
 
 def print_banner() -> None:
-    """Print MRPL Sovereign AI Workbench CLI banner."""
-    print("=" * 80)
-    print("   MANGALORE REFINERY AND PETROCHEMICALS LIMITED (MRPL)")
-    print("   Sovereign On-Premise Agentic AI Workbench - Member 1 RAG Engine")
-    print("   100% Offline | Air-Gapped | Local In-Process Inference")
-    print("=" * 80)
+    """Print MRPL Sovereign AI Workbench clean header."""
+    print("MRPL SOVEREIGN AGENTIC AI WORKBENCH")
+    print("───────────────────────────────────")
 
 
 def run_interactive_repl(
@@ -51,59 +58,93 @@ def run_interactive_repl(
     archetype: PromptArchetype,
     top_k: int,
     output_json: bool = False,
-    stream: bool = False,
+    stream: bool = True,
+    debug: bool = False,
 ) -> None:
-    """Run interactive question-answering session with multi-turn memory."""
-    print(f"\n[Session Initialized: {session_id} | Archetype: {archetype.value} | Model: {pipeline.generation.model.model_name}]")
-    print("Type your question below, or type 'exit' / 'quit' to end session.\n")
-
+    """Run interactive question-answering session with clean streaming chat interface."""
     while True:
         try:
-            query = input("User: ").strip()
+            print("\nYou")
+            query = input("> ").strip()
             if not query:
                 continue
             if query.lower() in ("exit", "quit", "q"):
-                print("\nExiting MRPL Sovereign AI Workbench. Goodbye.")
                 break
 
-            if stream:
-                print("\nAssistant: ", end="", flush=True)
-                retrieval_res, token_stream = pipeline.stream_query(
-                    query=query,
-                    session_id=session_id,
-                    archetype=archetype,
-                    top_k=top_k,
-                )
-                for tok in token_stream:
-                    print(tok, end="", flush=True)
-                print("\n")
-            else:
+            if output_json:
                 response = pipeline.answer(
                     question=query,
                     session_id=session_id,
                     archetype=archetype,
                     top_k=top_k,
                 )
+                output_dict = {
+                    "question": response.query,
+                    "answer": response.answer,
+                    "session_id": response.session_id,
+                    "confidence_score": response.confidence_score,
+                    "is_grounded": response.is_grounded,
+                    "total_latency_ms": response.total_latency_ms,
+                    "model_used": response.model_used,
+                    "citations": [c.model_dump() for c in response.citations],
+                    "execution_trace": response.execution_trace.to_dict() if response.execution_trace else None,
+                }
+                print(json.dumps(output_dict, indent=2))
+            elif stream:
+                print("\nAssistant")
+                retrieval_res, token_stream = pipeline.stream_query(
+                    query=query,
+                    session_id=session_id,
+                    archetype=archetype,
+                    top_k=top_k,
+                )
+                tokens: list[str] = []
+                for tok in token_stream:
+                    print(tok, end="", flush=True)
+                    tokens.append(tok)
+                full_answer = "".join(tokens)
+                print()
 
-                if output_json:
-                    output_dict = {
-                        "question": response.query,
-                        "answer": response.answer,
-                        "session_id": response.session_id,
-                        "confidence_score": response.confidence_score,
-                        "is_grounded": response.is_grounded,
-                        "total_latency_ms": response.total_latency_ms,
-                        "model_used": response.model_used,
-                        "citations": [c.model_dump() for c in response.citations],
-                        "execution_trace": response.execution_trace.to_dict() if response.execution_trace else None,
-                    }
-                    print(json.dumps(output_dict, indent=2))
+                # Record multi-turn conversation turn
+                chunk_ids = (
+                    [c.chunk.chunk_id for c in retrieval_res.candidates]
+                    if getattr(retrieval_res, "candidates", None)
+                    else []
+                )
+                citations = [
+                    getattr(c, "citation_id", f"[{i+1}]")
+                    for i, c in enumerate(retrieval_res.citations)
+                ]
+                pipeline.generation.memory.add_turn(
+                    session_id=session_id,
+                    user_query=query,
+                    response=full_answer,
+                    retrieved_chunk_ids=chunk_ids,
+                    citations=citations,
+                )
+
+                clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
+                concise_sources = ResponseFormatter.format_concise_sources(
+                    retrieval_res.citations,
+                    query=query,
+                    answer=clean_ans,
+                )
+                if concise_sources:
+                    print(f"\n{concise_sources}")
+            else:
+                print("\nAssistant")
+                response = pipeline.answer(
+                    question=query,
+                    session_id=session_id,
+                    archetype=archetype,
+                    top_k=top_k,
+                )
+                if debug:
+                    print(response.format_cli_output(detailed=True))
                 else:
-                    print(response.format_cli_output())
-                    print()
+                    print(response.format_clean_cli_output())
 
         except (KeyboardInterrupt, EOFError):
-            print("\n\nSession terminated by user. Goodbye.")
             break
         except Exception as e:
             print(f"\n[ERROR] An error occurred during query execution: {e}\n")
@@ -163,8 +204,21 @@ def main(args_list: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--stream",
+        dest="stream",
         action="store_true",
-        help="Stream tokens to terminal in real time",
+        default=True,
+        help="Stream tokens to terminal in real time (default: True)",
+    )
+    parser.add_argument(
+        "--no-stream",
+        dest="stream",
+        action="store_false",
+        help="Disable streaming generation and print full response at once",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Display full internal RAG execution details and unsuppressed warnings",
     )
     parser.add_argument(
         "--list-models",
@@ -173,6 +227,13 @@ def main(args_list: list[str] | None = None) -> None:
     )
 
     args = parser.parse_args(args_list)
+
+    if args.debug:
+        warnings.filterwarnings(
+            "default",
+            category=UserWarning,
+            message=r".*Local mode is not recommended for collections with more than 20,000 points.*",
+        )
 
     if args.list_models:
         print_banner()
@@ -224,44 +285,74 @@ def main(args_list: list[str] | None = None) -> None:
 
     if query:
         # Single query mode
-        if args.stream:
-            print_banner()
-            print(f"\nQuestion: {query}")
-            print("\nAssistant: ", end="", flush=True)
-            _, token_stream = pipeline.stream_query(
-                query=query,
-                session_id=args.session_id,
-                archetype=archetype,
-                top_k=args.top_k,
-            )
-            for tok in token_stream:
-                print(tok, end="", flush=True)
-            print("\n")
-        else:
+        if args.json:
             response = pipeline.answer(
                 question=query,
                 session_id=args.session_id,
                 archetype=archetype,
                 top_k=args.top_k,
             )
-            if args.json:
-                output_dict = {
-                    "question": response.query,
-                    "answer": response.answer,
-                    "session_id": response.session_id,
-                    "confidence_score": response.confidence_score,
-                    "is_grounded": response.is_grounded,
-                    "total_latency_ms": response.total_latency_ms,
-                    "model_used": response.model_used,
-                    "citations": [c.model_dump() for c in response.citations],
-                    "execution_trace": response.execution_trace.to_dict() if response.execution_trace else None,
-                }
-                print(json.dumps(output_dict, indent=2))
-            else:
-                print(response.format_cli_output())
+            output_dict = {
+                "question": response.query,
+                "answer": response.answer,
+                "session_id": response.session_id,
+                "confidence_score": response.confidence_score,
+                "is_grounded": response.is_grounded,
+                "total_latency_ms": response.total_latency_ms,
+                "model_used": response.model_used,
+                "citations": [c.model_dump() for c in response.citations],
+                "execution_trace": response.execution_trace.to_dict() if response.execution_trace else None,
+            }
+            print(json.dumps(output_dict, indent=2))
+        elif args.debug:
+            print_banner()
+            response = pipeline.answer(
+                question=query,
+                session_id=args.session_id,
+                archetype=archetype,
+                top_k=args.top_k,
+            )
+            print(response.format_cli_output(detailed=True))
+        elif args.stream:
+            print_banner()
+            print(f"\nYou\n> {query}")
+            print("\nAssistant")
+            retrieval_res, token_stream = pipeline.stream_query(
+                query=query,
+                session_id=args.session_id,
+                archetype=archetype,
+                top_k=args.top_k,
+            )
+            tokens: list[str] = []
+            for tok in token_stream:
+                print(tok, end="", flush=True)
+                tokens.append(tok)
+            full_answer = "".join(tokens)
+            print()
+
+            clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
+            concise_sources = ResponseFormatter.format_concise_sources(
+                retrieval_res.citations,
+                query=query,
+                answer=clean_ans,
+            )
+            if concise_sources:
+                print(f"\n{concise_sources}")
+        else:
+            print_banner()
+            print(f"\nYou\n> {query}")
+            print("\nAssistant")
+            response = pipeline.answer(
+                question=query,
+                session_id=args.session_id,
+                archetype=archetype,
+                top_k=args.top_k,
+            )
+            print(response.format_clean_cli_output())
     else:
         # Interactive mode
-        print_banner()
+        if not args.json:
+            print_banner()
         run_interactive_repl(
             pipeline=pipeline,
             session_id=args.session_id,
@@ -269,6 +360,7 @@ def main(args_list: list[str] | None = None) -> None:
             top_k=args.top_k,
             output_json=args.json,
             stream=args.stream,
+            debug=args.debug,
         )
 
 
