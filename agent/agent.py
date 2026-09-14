@@ -42,6 +42,7 @@ AgentResponse fields (always present, even on error)
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -138,6 +139,39 @@ class AgentResponse:
 
 
 # -- Internal helpers ---------------------------------------------------------
+
+# Image and scanned-document extensions that should bypass the 7-step plan
+# and route directly to VisionInspectorTool.
+_IMAGE_EXTENSIONS: frozenset = frozenset({
+    ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp",
+    ".pdf",   # treat as scanned document
+    ".svg",   # engineering drawing vector format
+})
+
+# Regex that matches any filesystem-style token (forward or back slashes,
+# dot-extension) with a recognised image extension.  We accept paths that
+# include directory separators so that e.g.
+#   datasets/handwritten_notes/HN_0001.jpg
+# is captured as a whole.
+_IMAGE_PATH_RE = re.compile(
+    r"(?:^|\s|['\"])"   # start of string, whitespace, or quote
+    r"([\w./\\-]+"      # path characters (no spaces)
+    r"(?:" + "|".join(re.escape(e) for e in sorted(_IMAGE_EXTENSIONS)) + r"))"
+    r"(?:$|\s|['\"])",  # end of string, whitespace, or quote
+    re.IGNORECASE,
+)
+
+
+def _extract_image_path(text: str) -> Optional[str]:
+    """Return the first image/document file path found in *text*, or None.
+
+    Searches for tokens that look like filesystem paths ending in a recognised
+    image or scanned-document extension.  Accepts both forward-slash and
+    back-slash separators.
+    """
+    m = _IMAGE_PATH_RE.search(text)
+    return m.group(1) if m else None
+
 
 def _safe_serialise(obj: Any) -> Any:
     """Return obj unchanged if JSON-serialisable, else str(obj)."""
@@ -275,6 +309,8 @@ class SovereignAgent:
                        - report_filename (str)         -- custom sandbox filename
                        - force_ungrounded_calc (bool)  -- force safety-gate demo
                        - max_steps (int)               -- cap on ReAct iterations
+                       - vision_file_path (str)        -- explicit image/PDF path
+                         (also auto-detected from user_request text).
 
         Returns
         -------
@@ -290,11 +326,44 @@ class SovereignAgent:
         - Any ToolResult with is_verified=False immediately halts execution.
         - The human-approval gate at Step 7 returns status="awaiting_approval"
           with a checkpoint_id the caller passes back to resume().
+
+        Vision Fast-Path
+        ----------------
+        If user_request contains a file path with an image or scanned-document
+        extension (.jpg, .jpeg, .png, .pdf, .tiff, .bmp, .webp, .svg) — or if
+        ``vision_file_path`` is supplied explicitly — the request is short-
+        circuited to ``ToolExecutor.execute('vision_inspector')`` directly,
+        bypassing the 7-step inspection plan.  The response ``output`` dict
+        contains::
+
+            {
+              "file_path"       : str   -- resolved path used,
+              "routing_decision": str   -- e.g. 'plain_document' / 'engineering_drawing',
+              "text"            : str   -- raw OCR / extracted text,
+              "key_value_fields": list  -- structured key-value pairs,
+              "equipment_list"  : list  -- equipment tags found,
+              "tables"          : list,
+              "summary"         : dict,
+              "question"        : str | None,
+              "execution_time_ms": float,
+            }
         """
         t0 = time.perf_counter()
         registry_snap = self._registry_snapshot()
         logger.info("SovereignAgent.handle | request=%r", user_request[:120])
 
+        # ── Vision Fast-Path ────────────────────────────────────────────────
+        # Detect image/PDF paths in the request and short-circuit to the
+        # vision tool, bypassing the 7-step document-inspection planner which
+        # has no mechanism to pick up image paths from free-text goals.
+        vision_file_path: Optional[str] = (
+            kwargs.pop("vision_file_path", None)
+            or _extract_image_path(user_request)
+        )
+        if vision_file_path:
+            return self._handle_vision(user_request, vision_file_path, t0, registry_snap, **kwargs)
+
+        # ── Standard 7-step planner path ────────────────────────────────────
         try:
             max_steps = int(kwargs.pop("max_steps", 10))
             result: PlanExecutionResult = self.planner.run(
@@ -321,6 +390,108 @@ class SovereignAgent:
             response.status,
             response.total_time_ms,
             response.checkpoint_id,
+        )
+        return response
+
+    def _handle_vision(
+        self,
+        user_request: str,
+        file_path: str,
+        t0: float,
+        registry_snap: Dict[str, Any],
+        **kwargs: Any,
+    ) -> AgentResponse:
+        """Direct vision fast-path: invoke VisionInspectorTool and return results.
+
+        Bypasses the 7-step ReAct planner entirely.  Accepts an explicit
+        ``question`` kwarg that is forwarded to the VLM layer if available.
+        """
+        logger.info(
+            "SovereignAgent._handle_vision | file=%r | request=%r",
+            file_path, user_request[:80],
+        )
+        question = kwargs.pop("question", user_request)  # use the full query as VLM prompt
+        document_category = kwargs.pop("document_category", "inspection_report")
+        use_vlm = kwargs.pop("use_vlm", False)
+
+        try:
+            tool_result = self.tool_executor.execute(
+                "vision_inspector",
+                file_path=file_path,
+                question=question,
+                document_category=document_category,
+                use_vlm=use_vlm,
+            )
+        except Exception as exc:
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            logger.error("SovereignAgent._handle_vision error: %s", exc, exc_info=True)
+            return AgentResponse(
+                status="failed",
+                error=str(exc),
+                total_time_ms=elapsed,
+                model_registry_status=registry_snap,
+            )
+
+        elapsed = (time.perf_counter() - t0) * 1000.0
+
+        if tool_result.status in ("success", "warning"):
+            agent_status = "completed"
+        elif tool_result.status == "capability_unavailable":
+            agent_status = "failed"
+        else:
+            agent_status = "requires_verification"
+
+        # Flatten the VisionInspectorTool output into a clean response payload
+        raw_out: Dict[str, Any] = tool_result.output or {}
+        output_payload: Dict[str, Any] = {
+            "file_path"        : file_path,
+            "routing_decision" : raw_out.get("routing_decision"),
+            "text"             : raw_out.get("text", ""),
+            "key_value_fields" : raw_out.get("key_value_fields", []),
+            "equipment_list"   : raw_out.get("equipment_list", []),
+            "tables"           : raw_out.get("tables", []),
+            "sections"         : raw_out.get("sections", []),
+            "summary"          : raw_out.get("summary", {}),
+            "question"         : question,
+            "execution_time_ms": raw_out.get("execution_time_ms", elapsed),
+        }
+        if "vlm" in raw_out:
+            output_payload["vlm"] = raw_out["vlm"]
+
+        response = AgentResponse(
+            status=agent_status,
+            requires_approval=False,
+            is_verified=tool_result.is_verified,
+            output=output_payload,
+            execution_trace=(
+                f"Vision fast-path: vision_inspector({file_path!r}) "
+                f"-> {tool_result.status} "
+                f"[{raw_out.get('routing_decision', 'unknown')}]"
+            ),
+            reasoning_steps=[{
+                "step_number": 1,
+                "name": "Vision OCR / Document Parse",
+                "step_type": "automated",
+                "action": f"vision_inspector(file_path={file_path!r})",
+                "observation": (
+                    f"Extracted {len(raw_out.get('text', ''))} chars | "
+                    f"routing={raw_out.get('routing_decision')} | "
+                    f"kv_fields={len(raw_out.get('key_value_fields', []))} | "
+                    f"equipment={len(raw_out.get('equipment_list', []))}"
+                ),
+                "status": tool_result.status,
+                "is_verified": tool_result.is_verified,
+                "execution_time_ms": round(elapsed, 2),
+            }],
+            error=tool_result.error,
+            total_time_ms=elapsed,
+            model_registry_status=registry_snap,
+        )
+        logger.info(
+            "SovereignAgent._handle_vision done | status=%s | chars=%d | time=%.1fms",
+            agent_status,
+            len(raw_out.get("text", "")),
+            elapsed,
         )
         return response
 

@@ -38,6 +38,7 @@ class IntentType(StrEnum):
     SPECIFICATION_LOOKUP = "specification_lookup"
     TABLE_LOOKUP = "table_lookup"
     NUMERICAL_LOOKUP = "numerical_lookup"
+    TEMPLATE_LOOKUP = "template_lookup"
     COMPARISON = "comparison"
     TROUBLESHOOTING = "troubleshooting"
 
@@ -103,6 +104,10 @@ class QueryAnalyzer:
     }
     _TABLE_KEYWORDS = {
         "table", "matrix", "schedule", "tabulated", "chart", "bill of materials", "bom",
+    }
+    _TEMPLATE_KEYWORDS = {
+        "template", "templates", "form", "forms", "checklist", "checklists",
+        "approval note", "blank_form", "work order template", "format", "sample form",
     }
     _NUMERICAL_KEYWORDS = {
         "limit", "maximum", "minimum", "max", "min", "pressure", "temperature",
@@ -230,6 +235,8 @@ class QueryAnalyzer:
         lower_tokens = set(re.findall(r"\b[a-z0-9-]+\b", text.lower()))
         matched_intents: list[IntentType] = []
 
+        if lower_tokens & self._TEMPLATE_KEYWORDS:
+            matched_intents.append(IntentType.TEMPLATE_LOOKUP)
         if lower_tokens & self._TROUBLESHOOTING_KEYWORDS:
             matched_intents.append(IntentType.TROUBLESHOOTING)
         if lower_tokens & self._INSPECTION_KEYWORDS:
@@ -267,7 +274,11 @@ class QueryAnalyzer:
         expand = False
         pref_cat = None
 
-        if primary == IntentType.TROUBLESHOOTING:
+        if primary == IntentType.TEMPLATE_LOOKUP:
+            top_k = 12
+            expand = True
+            pref_cat = "templates"
+        elif primary == IntentType.TROUBLESHOOTING:
             top_k = 25
             expand = True
             pref_cat = "manuals"

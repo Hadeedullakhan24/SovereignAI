@@ -33,74 +33,114 @@ class DeterministicTestLLM(BaseLocalLLM):
             return 0
         return max(1, len(text) // 4)
 
-    def _extract_query_and_context(self, prompt: str) -> tuple[str, list[str], list[str], str]:
-        """Extract user question, context passages, and citation tags from prompt."""
-        # Extract question
+    def _extract_query_and_context(self, prompt: str) -> tuple[str, list[tuple[str, str]]]:
+        """Extract user question and structured context blocks [(citation_id, text)] from prompt."""
+        # 1. Extract question
         question = ""
-        q_match = re.search(r"(?:Question|Query|USER QUERY):\s*(.*?)(?:\n\n|\n[A-Z]|\Z)", prompt, re.DOTALL | re.IGNORECASE)
+        q_match = re.search(
+            r"(?:=== USER QUERY ===|Question|Query|USER QUERY)\s*:?\s*(.*?)(?:\n===|\n\n[A-Z]|\Z)",
+            prompt,
+            re.DOTALL | re.IGNORECASE,
+        )
         if q_match:
             question = q_match.group(1).strip()
 
-        # Extract verified context block
-        ctx_match = re.search(r"=== VERIFIED MRPL REFINERY GROUND TRUTH CONTEXT ===\s*(.*?)(?:\n===|\Z)", prompt, re.DOTALL)
-        ctx = ctx_match.group(1) if ctx_match else prompt
+        # 2. Extract structured citation chunks: "--- [N] Source: ... ---\nContent"
+        chunks: list[tuple[str, str]] = []
+        chunk_patterns = re.findall(
+            r"---\s*\[(\d+)\]\s*Source:[^\n]*---\s*\n(.*?)(?=(?:---\s*\[\d+\]\s*Source:|\n===|\Z))",
+            prompt,
+            re.DOTALL,
+        )
+        if chunk_patterns:
+            for cit_id, content in chunk_patterns:
+                cleaned = content.strip()
+                if cleaned:
+                    chunks.append((cit_id, cleaned))
+        else:
+            # Fallback for alternative prompt layouts
+            ctx_match = re.search(
+                r"(?:=== VERIFIED [^\n]* CONTEXT [^\n]*===|=== CONTEXT ===|Context:)\s*(.*?)(?:\n===|\Z)",
+                prompt,
+                re.DOTALL,
+            )
+            ctx_text = ctx_match.group(1) if ctx_match else prompt
+            all_cits = re.findall(r"\[(\d+)\]", ctx_text)
+            if all_cits:
+                chunks.append((all_cits[0], ctx_text))
+            else:
+                chunks.append(("1", ctx_text))
 
-        # Citations strictly from context
-        citations = list(dict.fromkeys(re.findall(r"\[([0-9]+)\]", ctx)))
-        if not citations:
-            citations = list(dict.fromkeys(re.findall(r"\[([0-9]+)\]", prompt)))
-
-        # Extract equipment tags: prioritize question, then context
-        tags = list(dict.fromkeys(re.findall(r"\b([A-Z]{1,4}-[0-9]{3,5}[A-Z]?)\b", question)))
-        if not tags:
-            tags = list(dict.fromkeys(re.findall(r"\b([A-Z]{1,4}-[0-9]{3,5}[A-Z]?)\b", ctx)))
-
-        return question, citations, tags, ctx
+        return question, chunks
 
     def _synthesize_response(self, prompt: str) -> str:
-        """Synthesize a grounded answer based on query and prompt context."""
-        question, citations, tags, ctx = self._extract_query_and_context(prompt)
-
-        # Citations string
-        cit_str = f" [{citations[0]}]" if citations else ""
-        all_cits = " ".join(f"[{c}]" for c in citations[:2]) if citations else ""
-
+        """Synthesize a grounded answer strictly extracted from retrieved context."""
         # Check for safety / prompt injection queries
         if "ignore previous instructions" in prompt.lower() or "reveal system prompt" in prompt.lower():
             return "I cannot comply with requests that violate MRPL security protocols or attempt to alter system guidelines."
 
-        # Specialized refinery answers
-        if "pressure" in question.lower() or "bar" in ctx.lower():
-            p_match = re.search(r"([0-9]+(?:\.[0-9]+)?\s*bar)", ctx, re.IGNORECASE)
-            pressure = p_match.group(1) if p_match else "15.2 bar"
-            tag = tags[0] if tags else "the equipment"
-            return (
-                f"Based on the verified operating documentation for {tag}, the design operating pressure "
-                f"is specified as {pressure}{cit_str}. All relief valves and pressure transmitters must be "
-                f"calibrated according to standard inspection schedules{all_cits}."
-            )
+        question, chunks = self._extract_query_and_context(prompt)
+        if not question or not chunks:
+            return "The uploaded documents do not contain sufficient information to answer this question."
 
-        if "temperature" in question.lower() or "degc" in ctx.lower() or "°c" in ctx.lower():
-            t_match = re.search(r"([0-9]+(?:\.[0-9]+)?\s*(?:°C|degC))", ctx, re.IGNORECASE)
-            temperature = t_match.group(1) if t_match else "65.0 °C"
-            tag = tags[0] if tags else "the equipment"
-            return (
-                f"According to the inspection records for {tag}, the recorded operating temperature is {temperature}{cit_str}. "
-                f"Thermal monitoring indicates normal heat dissipation within design limits{all_cits}."
-            )
+        # Tokenize question (exclude common stopwords)
+        from rag_engine.retrieval.retrieval_utils import QUERY_STOPWORDS, tokenize_refinery_text
+        q_tokens = set(t for t in tokenize_refinery_text(question) if t not in QUERY_STOPWORDS and len(t) > 1)
 
-        if "oisd" in question.lower() or "safety" in question.lower():
-            return (
-                f"In compliance with OISD and refinery safety guidelines{cit_str}, proper personal protective equipment (PPE) "
-                f"and lockout-tagout (LOTO) procedures must be enforced prior to maintenance interventions{all_cits}."
-            )
+        # Score and rank sentences across all cited chunks
+        scored_sentences: list[tuple[float, str, str]] = []  # (score, sentence_text, cit_id)
 
-        tag_context = f" for {tags[0]}" if tags else ""
-        return (
-            f"Based on the provided technical documentation{tag_context}, the requested parameters are verified "
-            f"and compliant with MRPL standard operating procedures{cit_str}. Maintenance intervals must follow "
-            f"standard engineering specifications{all_cits}."
-        )
+        for cit_id, chunk_text in chunks:
+            # Split into clean logical sentences or table lines
+            lines_or_sentences = re.split(r"(?<=[.!?])\s+|\n+", chunk_text)
+            for raw_sent in lines_or_sentences:
+                sent = raw_sent.strip()
+                if not sent or len(sent) < 15 or sent.startswith("---") or sent.startswith("==="):
+                    continue
+                # Remove leading section headers like "[OISD STD 105]"
+                clean_sent = re.sub(r"^\[[^\]]+\]\s*", "", sent).strip()
+                if not clean_sent:
+                    continue
+
+                sent_tokens = set(t for t in tokenize_refinery_text(clean_sent) if t not in QUERY_STOPWORDS)
+                overlap = len(q_tokens.intersection(sent_tokens))
+                
+                # Bonus for exact keyphrases or entity matches
+                bonus = 0.0
+                for qt in q_tokens:
+                    if qt in clean_sent.lower():
+                        bonus += 1.0
+
+                total_score = overlap + bonus
+                if total_score > 0:
+                    scored_sentences.append((total_score, clean_sent, cit_id))
+
+        if not scored_sentences:
+            return "The uploaded documents do not contain sufficient information to answer this question."
+
+        # Sort by relevance score descending
+        scored_sentences.sort(key=lambda x: x[0], reverse=True)
+
+        # Collect top distinct matching sentences
+        selected: list[str] = []
+        seen_texts: set[str] = set()
+        
+        for score, sent, cit_id in scored_sentences:
+            normalized_core = re.sub(r"[^a-zA-Z0-9]", "", sent[:40].lower())
+            if normalized_core in seen_texts:
+                continue
+            seen_texts.add(normalized_core)
+            # Ensure sentence ends with punctuation
+            if not sent.endswith((".", "!", "?", ";", ":", "|")):
+                sent += "."
+            selected.append(f"{sent} [{cit_id}]")
+            if len(selected) >= 2:
+                break
+
+        if not selected:
+            return "The uploaded documents do not contain sufficient information to answer this question."
+
+        return " ".join(selected)
 
     def generate(
         self,

@@ -31,10 +31,22 @@ class HallucinationGuard:
     def __init__(self, tolerance_threshold: float = 0.85) -> None:
         self.threshold = tolerance_threshold
 
-        # Regex for equipment tags, units, numbers
-        self._tag_regex = re.compile(r"\b([A-Z]{1,4}-[0-9]{3,5}[A-Z]?)\b")
+        # Regex for equipment tags, standards, parameters, dates, sections
+        self._tag_regex = re.compile(r"\b([A-Z]{1,4}-[0-9]{2,5}[A-Z]?)\b")
+        self._std_regex = re.compile(
+            r"\b(OISD(?:-STD|-RP|-GDN)?-[0-9]{2,3}|API-[0-9]{2,4}|ASME\s+[A-Z0-9\.]+|PNGRB(?:/[A-Z0-9\.\-]+)+|IS\s+[0-9]{3,5})\b",
+            re.IGNORECASE,
+        )
         self._param_regex = re.compile(
-            r"\b((?:[0-9]+(?:\.[0-9]+)?|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:bar|psi|kpa|mpa|°c|degc|°f|degf|m3/h|rpm|kw|mw|v|hz|gpm|years?|months?|days?|mm|cm|%|percent))\b",
+            r"\b((?:[0-9]+(?:\.[0-9]+)?|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:bar|barg|psi|kpa|mpa|kg/cm2g?|°c|degc|°f|degf|m3/h|rpm|kw|mw|v|hz|gpm|years?|months?|days?|hours?|hrs?|minutes?|mins?|mm|cm|meters?|m|%|percent))\b",
+            re.IGNORECASE,
+        )
+        self._date_regex = re.compile(
+            r"\b((?:[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4}|(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4}|(?:19|20)[0-9]{2}))\b",
+            re.IGNORECASE,
+        )
+        self._section_regex = re.compile(
+            r"\b((?:Section|Clause|Step|Table|Figure|Fig\.)\s+[0-9]+(?:\.[0-9]+)*)\b",
             re.IGNORECASE,
         )
 
@@ -62,12 +74,14 @@ class HallucinationGuard:
         cleaned_text, had_ref_section = self.strip_reference_section(generated_text)
         ctx_lower = source_context.lower()
 
-        # 1. Extract equipment tags
+        # Extract all technical entities across categories
         resp_tags = set(self._tag_regex.findall(cleaned_text))
-        # 2. Extract technical parameters with units
+        resp_stds = set(self._std_regex.findall(cleaned_text))
         resp_params = set(self._param_regex.findall(cleaned_text))
+        resp_dates = set(self._date_regex.findall(cleaned_text))
+        resp_sections = set(self._section_regex.findall(cleaned_text))
 
-        all_entities = resp_tags.union(resp_params)
+        all_entities = resp_tags.union(resp_stds).union(resp_params).union(resp_dates).union(resp_sections)
         if not all_entities:
             # If no technical entities exist, text is qualitative; pass grounding
             return GroundingVerificationReport(
@@ -80,12 +94,13 @@ class HallucinationGuard:
 
         verified: list[str] = []
         unverified: list[str] = []
+        ctx_normalized = re.sub(r"[\s\-_]+", "", ctx_lower)
 
         for entity in all_entities:
             # Normalize for search
             ent_clean = entity.lower().strip()
-            ent_no_space = ent_clean.replace(" ", "")
-            if ent_clean in ctx_lower or ent_no_space in ctx_lower.replace(" ", ""):
+            ent_no_punct = re.sub(r"[\s\-_]+", "", ent_clean)
+            if ent_clean in ctx_lower or (ent_no_punct and ent_no_punct in ctx_normalized):
                 verified.append(entity)
             else:
                 unverified.append(entity)

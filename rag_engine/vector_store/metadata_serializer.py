@@ -63,6 +63,7 @@ class MetadataSerializer:
             "vector_checksum": chunk.vector_checksum,
             "model_name": chunk.model_name,
             "embedding_dimension": chunk.embedding_dimension,
+            "content": getattr(chunk, "content", None) or chunk.text_preview or "",
             "text_preview": chunk.text_preview or "",
             
             # Core Categorization & Ingestion Linage

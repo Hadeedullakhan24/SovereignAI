@@ -122,11 +122,11 @@ class GenerationConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     default_model_name: str = Field(
-        default="deterministic_test",
+        default="qwen2.5-1.5b-instruct",
         description="Active model identifier or path (e.g. 'qwen2.5-1.5b-instruct')",
     )
     models_dir: Path = Field(
-        default=Path("models/llms"),
+        default=Path("models/llm"),
         description="Local directory storing open-weight models for 100% offline loading",
     )
     device: str = Field(
@@ -164,4 +164,3 @@ class GenerationConfig(BaseModel):
         default=False,
         description="Strict zero external network telemetry / cloud reporting flag",
     )
-

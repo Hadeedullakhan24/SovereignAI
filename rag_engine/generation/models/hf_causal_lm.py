@@ -128,6 +128,9 @@ class HFLocalLLM(BaseLLM):
                         env_t = os.environ.get("TORCH_NUM_THREADS")
                         if env_t and env_t.strip().isdigit():
                             configured_threads = int(env_t.strip())
+                        else:
+                            cpu_cnt = os.cpu_count() or 4
+                            configured_threads = min(8, max(2, cpu_cnt // 2))
                     if configured_threads is not None and configured_threads > 0:
                         logger.info("Setting PyTorch CPU inference threads to %d", configured_threads)
                         torch.set_num_threads(configured_threads)

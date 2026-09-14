@@ -92,8 +92,53 @@ class MetadataBooster:
                     total_boost += prox
                     reasons.append(f"+{prox:.2f} adjacent page ({meta.page_number})")
 
+            # Substantive content check: penalize tiny artifact chunks (<50 chars)
+            content_clean = chunk.content.strip()
+            if len(content_clean) < 50:
+                total_boost -= 0.20
+                reasons.append("-0.20 tiny fragment penalty")
+
+            # Check if chunk mentions standard in content even if not in metadata array
+            if target_standards:
+                for std in target_standards:
+                    std_clean = std.lower().replace("-", "").replace(" ", "")
+                    cnt_clean = content_clean.lower().replace("-", "").replace(" ", "")
+                    if std_clean in cnt_clean:
+                        total_boost += 0.15
+                        reasons.append(f"+0.15 content standard match ({std})")
+
+            # Category contextual alignment boosts
+            cat_val = (meta.category or "").lower()
+            doc_name_lower = (meta.document_name or "").lower()
+            src_lower = (meta.source_path or "").lower()
+            query_lower = intent.normalized_query.lower()
+
+            # Template intent boost
+            if intent.primary_intent.value == "template_lookup" or "template" in query_lower or "form" in query_lower:
+                if "template" in cat_val or "template" in doc_name_lower or "template" in src_lower:
+                    total_boost += 0.25
+                    reasons.append("+0.25 template category match")
+
+            # Maintenance intent boost
+            if intent.primary_intent.value == "maintenance_lookup" or "maintenance" in query_lower or "repair" in query_lower or "work order" in query_lower:
+                if "maint" in cat_val or "maint" in doc_name_lower or "maint" in src_lower or "work_order" in doc_name_lower:
+                    total_boost += 0.20
+                    reasons.append("+0.20 maintenance category match")
+
+            # Email communication boost
+            if "email" in query_lower or "communicat" in query_lower or "mail" in query_lower:
+                if "email" in cat_val or "email" in src_lower or doc_name_lower.startswith("e"):
+                    total_boost += 0.20
+                    reasons.append("+0.20 email provenance match")
+
+            # Inspection report boost
+            if "inspection" in query_lower and ("report" in query_lower or "finding" in query_lower):
+                if "inspect" in cat_val or "inspect" in doc_name_lower:
+                    total_boost += 0.15
+                    reasons.append("+0.15 inspection category match")
+
             # Update score
-            new_score = item.score + total_boost
+            new_score = max(0.0, item.score + total_boost)
             explain = item.explainability
             if reasons:
                 explain += " Boosts: " + "; ".join(reasons)

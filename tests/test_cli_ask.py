@@ -147,12 +147,14 @@ class TestRAGPipelineAndCLI(unittest.TestCase):
         self.assertEqual(parsed["question"], response.query)
 
     def test_rag_response_format_cli_output(self) -> None:
-        """Test terminal output formatting of RAGResponse."""
+        """Test terminal output formatting of RAGResponse adhering to USER RESULT FIRST -> EVIDENCE -> TECHNICAL DETAILS."""
         response = self.pipeline.answer(question="What is the rated capacity of pump P-201?")
         output = response.format_cli_output()
-        self.assertIn("MRPL SOVEREIGN AGENTIC AI WORKBENCH - ANSWER", output)
+        self.assertIn("MRPL SOVEREIGN AGENTIC AI WORKBENCH", output)
         self.assertIn("Question:", output)
-        self.assertIn("Answer:", output)
+        self.assertIn("GENERATED", output)
+        self.assertIn("SOURCES / EVIDENCE", output)
+        self.assertIn("AI / RAG DETAILS", output)
         self.assertIn("Confidence Score", output)
         self.assertIn("Model Used", output)
 

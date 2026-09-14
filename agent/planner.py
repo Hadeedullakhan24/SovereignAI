@@ -355,6 +355,33 @@ class AgentPlanner:
         self.prompt_loader = prompt_loader or get_prompt_loader()
 
     # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    # Image/document extensions that Step 1 handles via vision_inspector
+    _VISION_EXTENSIONS: frozenset = frozenset({
+        ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp",
+        ".pdf",
+        ".svg",
+    })
+
+    @staticmethod
+    def _extract_image_path_from_goal(text: str) -> Optional[str]:
+        """Return the first image/document path found in *text*, or None.
+
+        Matches filesystem-style tokens (forward or back slashes, recognised
+        image extension) inside the free-text goal string.
+        """
+        pattern = re.compile(
+            r"(?:^|\s|['\"])"   # boundary
+            r"([\w./\\-]+\.(?:jpg|jpeg|png|bmp|tiff|tif|webp|pdf|svg))"
+            r"(?:$|\s|['\"])",  # boundary
+            re.IGNORECASE,
+        )
+        m = pattern.search(text)
+        return m.group(1) if m else None
+
+    # ------------------------------------------------------------------
     # Public Execution API
     # ------------------------------------------------------------------
 
@@ -390,7 +417,18 @@ class AgentPlanner:
         # Context accumulator across steps
         ctx = result.context_state
         ctx["user_goal"] = user_goal
-        ctx["report_filename"] = kwargs.get("report_filename", "pressure_vessel_inspection_002.md")
+
+        # If an explicit report_filename was provided, use it; otherwise check
+        # whether the user_goal itself embeds an image/document file path and
+        # promote that to report_filename so Step 1 can open it via
+        # vision_inspector instead of the default markdown fallback.
+        explicit_filename = kwargs.get("report_filename")
+        if explicit_filename:
+            ctx["report_filename"] = explicit_filename
+        else:
+            detected_path = self._extract_image_path_from_goal(user_goal)
+            ctx["report_filename"] = detected_path if detected_path else "pressure_vessel_inspection_002.md"
+
         ctx["force_ungrounded_calc"] = kwargs.get(
             "force_ungrounded_calc",
             ("ungrounded" in user_goal.lower() or "unverified" in user_goal.lower()),

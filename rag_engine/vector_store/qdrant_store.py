@@ -52,6 +52,26 @@ from rag_engine.vector_store.vector_utils import (
 logger = logging.getLogger(__name__)
 
 
+_local_client_pool: dict[str, QdrantClient] = {}
+_client_pool_lock = threading.RLock()
+
+
+def _shutdown_local_qdrant_pool() -> None:
+    with _client_pool_lock:
+        for client in list(_local_client_pool.values()):
+            try:
+                client.close()
+            except Exception:
+                pass
+        _local_client_pool.clear()
+
+
+try:
+    atexit.register(_shutdown_local_qdrant_pool)
+except Exception:
+    pass
+
+
 class QdrantVectorStore(BaseVectorStore):
     """Enterprise Qdrant driver supporting local embedded mode and distributed cluster mode."""
 
@@ -88,32 +108,40 @@ class QdrantVectorStore(BaseVectorStore):
                     timeout=int(self.config.timeout_seconds) if self.config.timeout_seconds is not None else None,
                 )
             else:
-                storage_path_str = str(self.config.storage_path)
-                if storage_path_str != ":memory:":
+                is_mem = str(self.config.storage_path) == ":memory:"
+                if not is_mem:
+                    storage_path_str = str(Path(self.config.storage_path).resolve())
                     self.config.storage_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    storage_path_str = ":memory:"
+
                 logger.info("Initializing Qdrant client in local embedded mode: %s", storage_path_str)
-                self.client = QdrantClient(path=storage_path_str)
+                storage_path_key = storage_path_str.lower() if not is_mem else ":memory:"
+                with _client_pool_lock:
+                    if not is_mem and storage_path_key in _local_client_pool:
+                        self.client = _local_client_pool[storage_path_key]
+                    else:
+                        self.client = QdrantClient(path=storage_path_str)
+                        if not is_mem:
+                            _local_client_pool[storage_path_key] = self.client
 
             self._is_initialized = True
-            try:
-                atexit.register(self.close)
-            except Exception:
-                pass
 
     def close(self) -> None:
         """Release client connection and close file handles."""
         with self._lock:
             if self.client is not None:
-                try:
-                    self.client.close()
-                except Exception as e:
-                    logger.warning("Error closing Qdrant client: %s", e)
+                is_mem = str(self.config.storage_path) == ":memory:"
+                storage_path_str = str(Path(self.config.storage_path).resolve()) if not is_mem else ":memory:"
+                storage_path_key = storage_path_str.lower() if not is_mem else ":memory:"
+                with _client_pool_lock:
+                    if is_mem or storage_path_key not in _local_client_pool:
+                        try:
+                            self.client.close()
+                        except Exception as e:
+                            logger.warning("Error closing Qdrant client: %s", e)
                 self.client = None
             self._is_initialized = False
-            try:
-                atexit.unregister(self.close)
-            except Exception:
-                pass
 
     def _ensure_client(self) -> QdrantClient:
         if not self._is_initialized or self.client is None:

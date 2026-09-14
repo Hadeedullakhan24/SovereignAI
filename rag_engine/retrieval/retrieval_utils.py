@@ -92,14 +92,24 @@ def estimate_token_count(text: str) -> int:
 def tokenize_refinery_text(text: str) -> list[str]:
     """Tokenize technical refinery text preserving equipment tags, standards, and metrics.
     
-    Splits on punctuation except hyphens inside alphanumeric identifiers (e.g. 'P-203', 'OISD-105').
+    Splits on punctuation except hyphens inside alphanumeric identifiers (e.g. 'P-203', 'OISD-105'),
+    and also generates sub-tokens for flexible cross-matching.
     """
     if not text:
         return []
-    # Replace punctuation other than hyphens and periods inside numbers with space
-    # Matches words with internal hyphens or alphanumeric tokens
     tokens = re.findall(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*|[0-9]+(?:\.[0-9]+)?", text)
-    return [t.lower() for t in tokens if t.strip()]
+    result = []
+    for t in tokens:
+        t_low = t.lower().strip()
+        if not t_low:
+            continue
+        result.append(t_low)
+        if "-" in t_low or "_" in t_low:
+            parts = re.split(r"[-_]+", t_low)
+            for p in parts:
+                if p:
+                    result.append(p)
+    return result
 
 
 def compute_sha256(content: str) -> str:

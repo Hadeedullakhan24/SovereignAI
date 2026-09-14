@@ -59,6 +59,7 @@ class EmbeddedChunk(BaseModel):
         default_factory=ChunkMetadata,
         description="Lineage, equipment tags, safety standards, and coordinate metadata inherited from Chunk",
     )
+    content: Optional[str] = Field(default=None, description="Full raw chunk content")
     text_preview: Optional[str] = Field(default=None, description="Short preview of embedded chunk text")
 
     @property

@@ -106,19 +106,9 @@ class MetadataFilterPlanner:
         if entities.plant_units:
             builder.equals("plant_unit", entities.plant_units[0])
 
-        # If safety standards detected
-        if entities.standards and intent.primary_intent == IntentType.SAFETY_LOOKUP:
-            for std in entities.standards:
-                builder.contains("safety_entities", std)
+        # Note: Do not impose hard category 'must' filters from intent alone;
+        # allow open multi-channel semantic and lexical retrieval across all corpus categories.
 
-        # Intent-driven category mapping (supporting refinery schema variations)
-        if not (entities.equipment_tags or entities.standards):
-            if intent.primary_intent == IntentType.INSPECTION_LOOKUP:
-                builder.in_list("category", ["inspection", "inspection_reports", "Inspection Report"])
-            elif intent.primary_intent == IntentType.MAINTENANCE_LOOKUP:
-                builder.in_list("category", ["maintenance", "manuals", "Maintenance"])
-            elif intent.primary_intent == IntentType.SAFETY_LOOKUP:
-                builder.in_list("category", ["safety", "safety_docs", "Safety Document"])
 
         # Page reference filter
         if entities.page_references:

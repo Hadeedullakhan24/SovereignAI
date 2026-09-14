@@ -36,6 +36,10 @@ from rag_engine.generation.generation_metrics import (
     GenerationMetricsCollector,
     get_current_process_memory_mb,
 )
+from rag_engine.generation.guardrails.answer_alignment_validator import (
+    AlignmentEvaluationReport,
+    AnswerAlignmentValidator,
+)
 from rag_engine.generation.guardrails.citation_validator import (
     CitationValidationReport,
     CitationValidator,
@@ -76,6 +80,7 @@ class GenerationResponse:
     grounding_report: GroundingVerificationReport
     confidence: ConfidenceBreakdown
     metrics: GenerationMetrics
+    alignment_report: Optional[AlignmentEvaluationReport] = None
     cache_hit: bool = False
 
 
@@ -105,6 +110,7 @@ class GenerationPipeline:
         self.hallucination_guard = HallucinationGuard(
             tolerance_threshold=self.config.guardrails.hallucination_tolerance_threshold
         )
+        self.alignment_validator = AnswerAlignmentValidator()
         self.safety_validator = SafetyValidator()
         self.confidence_scorer = ConfidenceScorer()
         self.streaming_manager = StreamingManager()
@@ -252,6 +258,7 @@ class GenerationPipeline:
             generated_text=gen_output.text,
             valid_anchors=prompt_payload.chunk_to_anchor_map,
             valid_sources=valid_sources,
+            citation_context=retrieval_result.citations,
         )
 
         # 7. Hallucination Guard Cross-Verification
@@ -261,21 +268,31 @@ class GenerationPipeline:
             source_context=context_text,
         )
 
-        # 8. Composite Confidence Calculation
+        # 8. Answer Alignment & Quality Evaluation
+        alignment_report = self.alignment_validator.evaluate(
+            query=query,
+            answer_text=ground_report.cleaned_text or cit_report.cleaned_text,
+            source_context=context_text,
+            is_grounded=ground_report.is_grounded,
+            is_citation_valid=cit_report.is_valid,
+        )
+
+        # 9. Composite Confidence Calculation
         avg_retrieval_score = (
             sum(c.score for c in retrieval_result.candidates) / len(retrieval_result.candidates)
             if retrieval_result.candidates
             else 0.5
         )
+        effective_grounding = ground_report.grounding_score if alignment_report.is_question_aligned else min(ground_report.grounding_score, 0.4)
         confidence = self.confidence_scorer.calculate(
             retrieval_confidence=avg_retrieval_score,
             citation_precision=cit_report.citation_precision,
-            grounding_score=ground_report.grounding_score,
+            grounding_score=effective_grounding,
         )
         guard_ms = (time.perf_counter() - start_guard) * 1000.0
 
-        # 9. Format Response with Provenance References
-        clean_ans = ground_report.cleaned_text or cit_report.cleaned_text
+        # 10. Format Response with Provenance References
+        clean_ans = alignment_report.cleaned_text
         final_answer = ResponseFormatter.format_with_provenance(
             answer_text=clean_ans,
             citations=retrieval_result.citations,
@@ -358,6 +375,7 @@ class GenerationPipeline:
             grounding_report=ground_report,
             confidence=confidence,
             metrics=metrics,
+            alignment_report=alignment_report,
             cache_hit=False,
         )
 
