@@ -27,6 +27,9 @@ def _runtime_root() -> Path:
 
 
 def default_vector_storage_path() -> Path:
+    local_p = Path("vector_db/qdrant")
+    if local_p.exists() and local_p.is_dir():
+        return local_p
     return _runtime_root() / "vector_db" / "qdrant"
 
 

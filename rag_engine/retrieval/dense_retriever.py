@@ -7,6 +7,7 @@ search, payload filtering, and neighbor retrieval in local air-gapped Qdrant sto
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import time
 from typing import Any, Optional
 
@@ -93,8 +94,8 @@ class DenseRetriever(BaseRetriever):
                 limit=top_k,
                 filters=q_filters,
             )
-            # If strict inferred filter produced zero hits, retry unfiltered semantic search
-            if not hits and q_filters is not None and not (isinstance(filters, MetadataFilter) or (isinstance(filters, dict) and filters)):
+            # If strict filter produced zero hits, retry unfiltered semantic search
+            if not hits and q_filters is not None:
                 hits = self.repository.find_by_vector(
                     query_vector=query_vector,
                     collection_name=target_col,
@@ -107,6 +108,20 @@ class DenseRetriever(BaseRetriever):
 
         dur_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Helper to resolve full chunk content if payload only contained text_preview
+        _bm25_chunks = getattr(self, "_cached_bm25_chunks", None)
+        if _bm25_chunks is None:
+            bm25_file = Path("cache/retrieval/bm25_index.json")
+            if bm25_file.exists():
+                try:
+                    from rag_engine.retrieval.bm25_retriever import BM25Index
+                    idx = BM25Index(storage_path=bm25_file)
+                    idx.load()
+                    self._cached_bm25_chunks = idx.chunks
+                    _bm25_chunks = self._cached_bm25_chunks
+                except Exception:
+                    pass
+
         # 4. Map ScoredVectorChunk to ScoredRetrievalChunk
         scored_chunks: list[ScoredRetrievalChunk] = []
         citations: list[CitationBundle] = []
@@ -115,6 +130,8 @@ class DenseRetriever(BaseRetriever):
             meta = hit.metadata
             payload = hit.payload or {}
             content = payload.get("content") or payload.get("text_preview") or hit.text_preview or ""
+            if (not content or len(content) <= 120) and _bm25_chunks and hit.chunk_id in _bm25_chunks:
+                content = _bm25_chunks[hit.chunk_id].content
 
             # Build hierarchy
             prev_id = payload.get("prev_chunk_id")

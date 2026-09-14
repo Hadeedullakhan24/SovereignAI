@@ -15,9 +15,17 @@ def runtime_root() -> Path:
     configured = os.environ.get("SOVEREIGNAI_RUNTIME_DIR")
     if configured:
         return Path(configured).expanduser().resolve()
+    ws_cache = Path.cwd() / "cache"
+    if ws_cache.exists() or Path("datasets").exists():
+        return ws_cache
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / "SovereignAI" / "runtime"
+        try:
+            p = Path(local_app_data) / "SovereignAI" / "runtime"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
     return Path.cwd() / ".sovereignai_runtime"
 
 

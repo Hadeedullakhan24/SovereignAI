@@ -1,19 +1,22 @@
 """Prompt Templates — Domain Archetypes for Refinery Knowledge Operations.
 
-Defines deterministic system prompts and instruction formats across 7 refinery
-query archetypes: Equipment Lookup, SOP Retrieval, Maintenance, Safety Compliance,
-Troubleshooting, Comparison, and General Engineering QA.
+Defines deterministic system prompts and instruction formats across refinery query
+and document generation archetypes: Equipment Lookup, SOP Retrieval, Maintenance,
+Safety Compliance, Troubleshooting, Comparison, General Engineering QA, Email Drafting,
+Report Generation, Approval Notes, Summaries, Data Extraction, and Document Analysis.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import re
 from typing import Dict
 
 
 class PromptArchetype(str, Enum):
-    """Refinery query archetypes determining generation instructions."""
+    """Refinery query and task archetypes determining generation instructions."""
 
     EQUIPMENT_LOOKUP = "equipment_lookup"
     SOP_RETRIEVAL = "sop_retrieval"
@@ -22,9 +25,14 @@ class PromptArchetype(str, Enum):
     TROUBLESHOOTING = "troubleshooting"
     COMPARISON = "comparison"
     GENERAL_QA = "general_qa"
-
-
-import hashlib
+    EMAIL = "email"
+    REPORT = "report"
+    APPROVAL_NOTE = "approval_note"
+    SUMMARY = "summary"
+    EXTRACTION = "extraction"
+    PROCEDURE = "procedure"
+    ANALYSIS = "analysis"
+    SPECIFICATION = "specification"
 
 
 @dataclass(frozen=True)
@@ -34,10 +42,10 @@ class PromptTemplate:
     archetype: PromptArchetype
     system_instruction: str
     generation_instruction: str
-    template_version: str = "v1.0.0"
+    template_version: str = "v1.1.0"
     name: str = ""
     author: str = "MRPL AI Engineering Team"
-    creation_date: str = "2026-09-10"
+    creation_date: str = "2026-09-14"
     compatibility: str = "v1.x"
     prompt_hash: str = ""
 
@@ -61,18 +69,28 @@ class PromptTemplate:
 
 _SYSTEM_PREAMBLE = (
     "You are the Sovereign AI Assistant for Mangalore Refinery and Petrochemicals Limited (MRPL).\n"
-    "Your objective is to provide precise, technically accurate, and strictly evidence-grounded answers.\n"
+    "Your objective is to provide precise, technically detailed, and strictly evidence-grounded answers.\n"
     "CRITICAL RULES:\n"
     "1. Answer solely using the verified documentation provided in the CONTEXT section.\n"
-    "2. Answer ONLY what the user's question explicitly asks. Do NOT proactively volunteer disclaimers or mention unrelated topics that were not requested.\n"
-    "3. STRICT GROUNDING: Quote exact figures, readings, and dates directly from the context. "
-    "Do NOT extrapolate generic rules, percentages, or intervals from outside knowledge. "
-    "If a specific parameter, interval, or requirement requested by the user's question is NOT found in the context, state that this specific information is not specified in the available documentation.\n"
-    "4. Every assertion containing technical parameters, dates, limits, or procedures MUST cite its source using bracketed numbers like [1] or [2].\n"
-    "5. NO BIBLIOGRAPHY / NO REFERENCE SECTION: Do NOT generate a References, Bibliography, or Sources section at the end of your answer. "
+    "2. DIRECT ANSWER FIRST: Directly answer the core question in the first sentence, followed by supporting technical details, conditions, and context.\n"
+    "3. STATUS PRESERVATION & ACTION DISCIPLINE:\n"
+    "   - Preserve the exact meaning of source statuses: 'Action Required', 'Proposed Action', 'Recommended', 'Approved', 'Scheduled', 'Planned', 'Open', vs 'Completed'.\n"
+    "   - NEVER convert or upgrade a required, proposed, recommended, or planned action into a completed action.\n"
+    "   - If the context lists an 'Action Required' or 'Proposed action', state the recorded status explicitly (e.g. 'The email lists analysing readings as an action required [1]', 'The approval note proposes carrying out the approved inspection scope [2]').\n"
+    "   - Clearly distinguish what the documents establish versus what they do not establish (e.g. explain that proposed or required actions are recorded, but the documents do not establish that maintenance was completed).\n"
+    "4. NO CONTRADICTIONS: Never state that 'no action was recorded' if proposed, required, or open actions exist in the retrieved evidence. Accurately state what was recorded without self-contradiction.\n"
+    "5. SUFFICIENT & EVIDENCE-BOUND DETAIL: Provide a clear, well-structured response (1-3 short paragraphs or 3-7 bullet points) based strictly on retrieved facts. Do not produce overly short one-line dismissals when useful evidence exists. Do not add outside assumptions or speculative filler.\n"
+    "6. STRICT GROUNDING & ANTI-FABRICATION: Use only facts explicitly supported by the retrieved citations. "
+    "Do not complete, extend, infer, or reconstruct lists, definitions, requirements, numbers, units, dates, percentages, measurements, procedures, or other facts that are not explicitly present in the retrieved evidence. "
+    "If a specific parameter is not documented in the context, explicitly state: 'The retrieved documentation does not specify the [parameter] for [entity].'\n"
+    "7. NO SPECULATIVE INFERENCES: Never infer unstated technical parameters, operating conditions, or temperatures from equipment type or general industry practice. "
+    "Never use speculative words like 'likely', 'typically', 'normally', 'usually', or 'expected' to guess missing information.\n"
+    "8. NO CIRCULAR DEFINITIONS: Do not give circular answers (such as stating 'The PPE required is Personal Protective Equipment'). If specific items or procedures are not listed, state that the document requires the item but does not detail the specific list.\n"
+    "9. CITATIONS: In technical QA, summaries, or reports, cite source statements with inline bracket citations like [1] or [2]. In formal emails, omit inline bracket numbers and state facts naturally.\n"
+    "10. NO BIBLIOGRAPHY / NO REFERENCE SECTION: Do NOT generate a References, Bibliography, or Sources section at the end of your answer. "
     "Provenance is added automatically by the system. Use ONLY inline bracket citations [n] within your sentences — never list document titles, filenames, or quotes yourself.\n"
-    "6. Do NOT hallucinate equipment tags, operating limits, numbers, or standards.\n"
-    "7. Maintain refinery engineering rigor at all times."
+    "11. NO META-COMMENTARY: State the answer directly without conversational filler or preambles like 'Therefore, the response would be...'.\n"
+    "12. Maintain refinery engineering rigor at all times."
 )
 
 TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
@@ -86,8 +104,24 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         generation_instruction=(
             "Structure your answer with:\n"
             "1. Equipment Tag & Unit identification.\n"
-            "2. Table or list of verified technical parameters with citations [n].\n"
-            "3. Any critical operating boundaries or alarm setpoints."
+            "2. Direct verified technical parameters and operating limits with citations [n].\n"
+            "3. If a requested parameter is not documented in the context, explicitly state that it is not specified in the available records.\n"
+            "Do NOT append a References or Bibliography section."
+        ),
+    ),
+    PromptArchetype.SPECIFICATION: PromptTemplate(
+        archetype=PromptArchetype.SPECIFICATION,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Technical Specifications & Parameter Lookup.\n"
+            "Extract exact design operating pressures, temperatures, metallurgy, flow rates, and tag numbers."
+        ),
+        generation_instruction=(
+            "Structure your answer with:\n"
+            "1. Direct verified parameter and unit (e.g. Design Pressure: 10.5 kg/cm²g) with citation [n].\n"
+            "2. Supporting context from the source document (report number, equipment ID, inspection date).\n"
+            "3. If the parameter is not documented in the retrieved records, explicitly state that it is not specified in the available documentation.\n"
+            "Do NOT append a References or Bibliography section."
         ),
     ),
     PromptArchetype.SOP_RETRIEVAL: PromptTemplate(
@@ -101,7 +135,23 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
             "Structure your answer with:\n"
             "1. Prerequisites and authorization permits required.\n"
             "2. Numbered step-by-step execution procedure with citations [n].\n"
-            "3. Post-execution verification and restoration checks."
+            "3. Post-execution verification and restoration checks.\n"
+            "Do NOT append a References or Bibliography section."
+        ),
+    ),
+    PromptArchetype.PROCEDURE: PromptTemplate(
+        archetype=PromptArchetype.PROCEDURE,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Operational Procedures & Instructions.\n"
+            "Provide step-by-step sequential instructions based solely on verified SOPs."
+        ),
+        generation_instruction=(
+            "Structure your answer with:\n"
+            "1. Prerequisites and required work permits [n].\n"
+            "2. Numbered sequential operational steps.\n"
+            "3. Safety warnings, interlocks, and control measures.\n"
+            "Do NOT append a References or Bibliography section."
         ),
     ),
     PromptArchetype.MAINTENANCE: PromptTemplate(
@@ -109,13 +159,14 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         system_instruction=(
             f"{_SYSTEM_PREAMBLE}\n\n"
             "OPERATING FOCUS: Preventive & Corrective Maintenance.\n"
-            "Focus on inspection intervals, wear tolerances, lubrication schedules, and failure modes."
+            "Focus on inspection intervals, wear tolerances, lubrication schedules, and action statuses."
         ),
         generation_instruction=(
             "Structure your answer with:\n"
-            "1. Maintenance scope and required isolation procedures.\n"
-            "2. Inspection checkpoints, clearances, and replacement criteria with citations [n].\n"
-            "3. Verification tests prior to recommissioning."
+            "1. Equipment tag and direct summary of recorded actions with citations [n].\n"
+            "2. Specific action details, conditions, and exact recorded status (e.g. required, proposed, approved, or completed).\n"
+            "3. Clear distinction between what the documents establish vs what they do not establish (e.g. whether maintenance was completed).\n"
+            "Do NOT append a References or Bibliography section."
         ),
     ),
     PromptArchetype.SAFETY_COMPLIANCE: PromptTemplate(
@@ -128,10 +179,10 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         generation_instruction=(
             "Structure your answer with:\n"
             "1. Governing standard citations (e.g. OISD-105, OISD-116) [n].\n"
-            "2. Mandatory safety precautions, PPE, and isolation boundaries.\n"
+            "2. Mandatory safety precautions, permits, PPE, and isolation boundaries specified in the context.\n"
             "3. Hazard mitigation protocols and emergency actions.\n"
             "If any requested statutory interval, thickness, or limit is not explicitly documented in the context, "
-            "state that it is not specified in the available documentation. "
+            "state that it is not specified in the available documentation.\n"
             "Do NOT append a References or Bibliography section."
         ),
     ),
@@ -146,7 +197,8 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
             "Structure your answer with:\n"
             "1. Potential root causes correlated with documented symptoms [n].\n"
             "2. Diagnostic checks to confirm the fault.\n"
-            "3. Corrective remedies and preventive recommendations."
+            "3. Corrective remedies and preventive recommendations.\n"
+            "Do NOT append a References or Bibliography section."
         ),
     ),
     PromptArchetype.COMPARISON: PromptTemplate(
@@ -158,23 +210,183 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         ),
         generation_instruction=(
             "Structure your answer with:\n"
-            "1. Comparison summary table highlighting differences [n].\n"
-            "2. Analysis of operational trade-offs and design variances."
+            "1. A clean markdown comparison table highlighting differences and attributes across the compared items.\n"
+            "2. Explanatory analysis of verified parameters and operating limits.\n"
+            "3. If any parameter is not documented for an item, state 'Not specified in available documentation' in the table.\n"
+            "Do NOT append a References or Bibliography section."
+        ),
+    ),
+    PromptArchetype.EMAIL: PromptTemplate(
+        archetype=PromptArchetype.EMAIL,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Professional Email Drafting.\n"
+            "Draft a professional, well-structured business email based solely on retrieved documentation."
+        ),
+        generation_instruction=(
+            "Draft a clean, professional email adhering strictly to retrieved facts:\n"
+            "Subject: [Concise and informative subject line]\n\n"
+            "Dear [Recipient / Team / Management],\n\n"
+            "[Body paragraphs explaining background, equipment condition, and exact proposed/required scope]\n\n"
+            "Best regards,\n"
+            "[Engineering / Operations Team]\n\n"
+            "EMAIL FORMATTING RULES:\n"
+            "- Do NOT include bracket citations [n], bibliography, or debug tokens in the email body.\n"
+            "- Do NOT claim files or attachments are attached unless confirmed in the evidence.\n"
+            "- Preserve exact status: If the request asks for an email regarding a proposed action, draft it as requesting approval for the proposed action.\n"
+            "- If the user asks to state that maintenance is completed, but the documents do NOT confirm completion, DO NOT falsely claim completion. State clearly in the email that the records document a proposed/required scope but completion is not established, and request confirmation."
+        ),
+    ),
+    PromptArchetype.APPROVAL_NOTE: PromptTemplate(
+        archetype=PromptArchetype.APPROVAL_NOTE,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Formal Approval & Recommendation Notes.\n"
+            "Draft a formal approval/recommendation note with strict status preservation."
+        ),
+        generation_instruction=(
+            "Format the response as a formal Approval / Recommendation Note:\n"
+            "**Equipment:** [Equipment ID and Type]\n"
+            "**Area / Unit:** [Plant Area / Unit]\n"
+            "**Observed Condition / Issue:** [Issue identified in records]\n"
+            "**Proposed Action:** [Proposed inspection or maintenance scope]\n"
+            "**Required Decision / Approval:** [Specific scope requiring authorization]\n"
+            "**Controls & Execution Window:** [Controls and agreed window]\n"
+            "**Current Status:** [Status, e.g. Pending Approval / Proposed]\n\n"
+            "Strictly maintain that this is a proposed action requiring approval and does NOT represent completed maintenance."
+        ),
+    ),
+    PromptArchetype.SUMMARY: PromptTemplate(
+        archetype=PromptArchetype.SUMMARY,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Executive & Technical Summaries.\n"
+            "Provide a concise, structured summary synthesizing verified evidence."
+        ),
+        generation_instruction=(
+            "Provide a structured summary with clear bullet points:\n"
+            "- **Key Findings & Equipment Context:** [Summary of verified facts]\n"
+            "- **Recorded Actions & Statuses:** [Action required, proposed, or approved, preserving status]\n"
+            "- **Key Limits / Conditions:** [Operating limits, dates, parameters]\n"
+            "- **Unestablished / Pending Information:** [What the documents do not establish, e.g. completion status]\n"
+            "Do NOT append a References or Bibliography section."
+        ),
+    ),
+    PromptArchetype.REPORT: PromptTemplate(
+        archetype=PromptArchetype.REPORT,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Technical & Inspection Reports.\n"
+            "Structure formal technical reports with executive summaries and findings."
+        ),
+        generation_instruction=(
+            "Structure the report with appropriate markdown sections:\n"
+            "# [Report Title]\n"
+            "## 1. Executive Summary\n"
+            "## 2. Technical Findings & Condition Assessment\n"
+            "## 3. Proposed Actions & Controls (preserving exact source status)\n"
+            "## 4. Conclusion & Recommendations\n"
+            "Do NOT append a References or Bibliography section."
+        ),
+    ),
+    PromptArchetype.EXTRACTION: PromptTemplate(
+        archetype=PromptArchetype.EXTRACTION,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Structured Data Extraction.\n"
+            "Extract requested fields, parameters, or template requirements into clear tables or lists."
+        ),
+        generation_instruction=(
+            "Present the extracted data in a clean markdown table or structured list:\n"
+            "| Field / Parameter | Description / Required Value |\n"
+            "Only include fields explicitly supported by the retrieved documentation.\n"
+            "Do NOT append a References or Bibliography section."
+        ),
+    ),
+    PromptArchetype.ANALYSIS: PromptTemplate(
+        archetype=PromptArchetype.ANALYSIS,
+        system_instruction=(
+            f"{_SYSTEM_PREAMBLE}\n\n"
+            "OPERATING FOCUS: Document & Evidence Analysis.\n"
+            "Analyze what retrieved records establish versus what remains unresolved."
+        ),
+        generation_instruction=(
+            "Structure your analysis with:\n"
+            "- **Established Facts & Scope:** [What the documents explicitly confirm with citations [n]]\n"
+            "- **Recorded Actions & Status:** [Action required, proposed, or approved]\n"
+            "- **Unresolved / Missing Information:** [What the documents do not establish]\n"
+            "Do NOT append a References or Bibliography section."
         ),
     ),
     PromptArchetype.GENERAL_QA: PromptTemplate(
         archetype=PromptArchetype.GENERAL_QA,
         system_instruction=_SYSTEM_PREAMBLE,
         generation_instruction=(
-            "Provide a concise, direct answer addressing only what was asked in the user query, based strictly on the verified context, "
-            "citing source statements with [n]. Quote exact readings, dates, and limits directly from the context. "
-            "If the user query asks about a specific parameter, interval, or requirement that is not documented in the context, "
-            "explicitly state that this specific information is not specified in the available documentation. "
-            "Do NOT volunteer disclaimers about topics not asked for. "
-            "Do NOT append a References, Bibliography, or Sources section."
+            "Provide a comprehensive, direct, and well-structured answer addressing the user query based strictly on all relevant retrieved evidence, "
+            "citing source statements with inline citations [n].\n"
+            "- Directly state the core answer in the opening sentence, synthesizing all relevant retrieved records.\n"
+            "- When multiple documents provide relevant details (e.g. an alert email and an approval note), describe each recorded item, its scope, and its recorded status (e.g. 'Action Required' [1], 'Proposed Action' [2]).\n"
+            "- Explicitly distinguish what the documents establish from what they do not establish (e.g. state what actions were required or proposed, while noting that the documents do not establish whether the action was completed).\n"
+            "- Strictly preserve source status distinctions without internal contradictions.\n"
+            "- Do NOT append a References, Bibliography, or Sources section."
         ),
     ),
 }
+
+
+def detect_task_type(query: str) -> PromptArchetype:
+    """Classify user query into appropriate task archetype based on intent and keywords."""
+    q_lower = query.lower().strip()
+
+    # 1. Email detection
+    if any(k in q_lower for k in ["draft an email", "write an email", "compose an email", "send an email", "draft email"]):
+        return PromptArchetype.EMAIL
+
+    # 2. Approval Note
+    if any(k in q_lower for k in ["approval note", "recommendation note", "prepare an approval note"]):
+        return PromptArchetype.APPROVAL_NOTE
+
+    # 3. Report
+    if any(k in q_lower for k in ["prepare a report", "inspection report", "maintenance report", "generate a report", "write a report", "technical report"]):
+        return PromptArchetype.REPORT
+
+    # 4. Summary
+    if any(k in q_lower for k in ["summarize", "summary", "short summary", "brief summary", "overview"]):
+        return PromptArchetype.SUMMARY
+
+    # 5. Comparison
+    if any(k in q_lower for k in ["compare", "comparison", "differences between", "versus", " vs "]):
+        return PromptArchetype.COMPARISON
+
+    # 6. Extraction / Required Fields
+    if any(k in q_lower for k in ["what fields", "list all fields", "extract the following", "required fields", "fields are required", "fields required"]):
+        return PromptArchetype.EXTRACTION
+
+    # 7. Safety / Compliance
+    if any(k in q_lower for k in ["safety requirements", "safety precautions", "hot work", "work permit", "ppe", "loto", "oisd-std-", "oisd", "safety standard", "statutory requirement"]):
+        return PromptArchetype.SAFETY_COMPLIANCE
+
+    # 8. Procedure / SOP
+    if any(k in q_lower for k in ["procedure", "sop", "steps to", "how to perform", "operational steps", "instructions for"]):
+        return PromptArchetype.SOP_RETRIEVAL
+
+    # 9. Technical Specifications / Equipment Lookup
+    if any(k in q_lower for k in ["design pressure", "design temperature", "operating pressure", "operating temperature", "rated capacity", "flow rate", "metallurgy", "specs of", "specification", "knockout drum"]):
+        return PromptArchetype.SPECIFICATION
+
+    # 10. Maintenance / Inspection
+    if any(k in q_lower for k in ["maintenance action", "maintenance recorded", "inspection action", "lubrication schedule", "overhaul"]):
+        return PromptArchetype.MAINTENANCE
+
+    # 11. Troubleshooting / RCA
+    if any(k in q_lower for k in ["troubleshoot", "root cause", "failure mode", "diagnostic check", "abnormal vibration"]):
+        return PromptArchetype.TROUBLESHOOTING
+
+    # 12. Document Analysis
+    if any(k in q_lower for k in ["analyze this", "review the inspection", "what does this document establish", "document analysis"]):
+        return PromptArchetype.ANALYSIS
+
+    return PromptArchetype.GENERAL_QA
 
 
 class PromptTemplateRegistry:

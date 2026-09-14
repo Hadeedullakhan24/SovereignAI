@@ -15,6 +15,7 @@ from rag_engine.generation.prompt.context_window_builder import ContextWindowBui
 from rag_engine.generation.prompt.prompt_templates import (
     PromptArchetype,
     PromptTemplateRegistry,
+    detect_task_type,
 )
 from rag_engine.generation.prompt.token_budget_manager import TokenBudgetManager
 from rag_engine.interfaces.base_prompt import BasePromptBuilder
@@ -32,7 +33,7 @@ class PromptBuilder(BasePromptBuilder):
         template_registry: PromptTemplateRegistry | None = None,
         context_builder: ContextWindowBuilder | None = None,
         budget_manager: TokenBudgetManager | None = None,
-        prompt_version: str = "v1.0.0",
+        prompt_version: str = "v1.1.0",
         retrieval_version: str = "m8_v1.0",
     ) -> None:
         self.templates = template_registry or PromptTemplateRegistry()
@@ -52,7 +53,19 @@ class PromptBuilder(BasePromptBuilder):
         **kwargs: Any,
     ) -> RetrievedPrompt:
         """Construct deterministic prompt payload with cryptographic hash."""
-        template = self.templates.get_template(archetype)
+        # Auto-detect specialized archetype from query if generic QA was specified
+        if isinstance(archetype, str):
+            try:
+                arch_enum = PromptArchetype(archetype.lower().strip())
+            except ValueError:
+                arch_enum = PromptArchetype.GENERAL_QA
+        else:
+            arch_enum = archetype
+
+        if arch_enum == PromptArchetype.GENERAL_QA:
+            arch_enum = detect_task_type(query)
+
+        template = self.templates.get_template(arch_enum)
 
         # 1. Build Context Window within context budget
         context_budget = self.budget_manager.config.retrieved_context_budget
@@ -77,19 +90,34 @@ class PromptBuilder(BasePromptBuilder):
         system_tokens = self.budget_manager.estimate_tokens(system_text)
         query_text = f"\n=== USER QUERY ===\n{query.strip()}\n"
         query_tokens = self.budget_manager.estimate_tokens(query_text)
-        instruction_text = (
-            f"\n=== INSTRUCTIONS FOR RESPONSE ===\n"
-            f"{template.generation_instruction}\n"
-            "MANDATORY CONSTRAINTS:\n"
-            "- Do NOT generate a References, Bibliography, Sources, or Source(s) section at the end of your answer. "
-            "Provenance is added automatically by the system. Use ONLY inline bracket citations [n] within your sentences — "
-            "never list document titles, filenames, or quotes yourself.\n"
-            "- Answer ONLY what the user query asks. Quote exact values and readings directly from the context. "
-            "Do NOT invent unwritten rules or generic intervals from outside knowledge.\n"
-            "- Only if the user query asks for a specific fact, interval, or parameter that is absent from the context, "
-            "state that it is not specified in the available documentation. Do NOT volunteer disclaimers for unasked topics.\n\n"
-            "ASSISTANT: "
-        )
+
+        if arch_enum == PromptArchetype.EMAIL:
+            instruction_text = (
+                f"\n=== INSTRUCTIONS FOR EMAIL DRAFTING ===\n"
+                f"{template.generation_instruction}\n"
+                "MANDATORY EMAIL CONSTRAINTS:\n"
+                "- Write a complete, polished email with 'Subject:', salutation ('Dear [Recipient/Team],'), structured body, and sign-off ('Best regards,').\n"
+                "- Do NOT include inline bracket citations like [1] or [2] inside the email text. State the verified facts naturally.\n"
+                "- Do NOT insert a References or Sources section inside the email.\n"
+                "- Preserve exact status: If the source documents state an action is proposed or required, draft the email to communicate or request approval for the PROPOSED scope.\n"
+                "- If the user asks to state maintenance was completed but the documents do not confirm completion, state clearly in the email/notice that completion is not confirmed by records.\n"
+                "- Do NOT claim files are attached.\n\n"
+                "ASSISTANT: "
+            )
+        else:
+            instruction_text = (
+                f"\n=== INSTRUCTIONS FOR RESPONSE ===\n"
+                f"{template.generation_instruction}\n"
+                "MANDATORY CONSTRAINTS:\n"
+                "- DIRECT ANSWER FIRST: Directly answer what the user query asks in the first sentence. Use inline bracket citations [n] for every factual assertion.\n"
+                "- STATUS PRESERVATION: Preserve exact status designations (required, proposed, recommended, approved, scheduled, planned, open, vs completed). Never claim an action was completed or carried out unless the evidence explicitly states completion.\n"
+                "- NO CONTRADICTIONS: Do not state 'no action was recorded' if proposed, required, or open actions exist. Clearly explain what the documents establish versus what they do not establish.\n"
+                "- SUFFICIENT & EVIDENCE-BOUND DETAIL: Provide clear paragraphs, bullet points, or tables strictly grounded in the retrieved citations. Quote exact parameters, limits, and status designations.\n"
+                "- If a specific parameter or detail is not documented in the context, explicitly state: 'The retrieved documentation does not specify the [parameter] for [entity].'\n"
+                "- NO META-COMMENTARY: State the findings directly without conversational filler or preambles (e.g. do not say 'Therefore, the response would be...').\n"
+                "- Do NOT generate a References, Bibliography, Sources, or Source(s) section at the end of your answer. Provenance is added automatically.\n\n"
+                "ASSISTANT: "
+            )
 
         prompt_components = [
             system_text,

@@ -20,6 +20,7 @@ from rag_engine.interfaces.base_embedder import BaseEmbedder
 from rag_engine.schemas.chunk import Chunk
 from rag_engine.schemas.embedding import (
     EmbeddedChunk,
+    EmbeddingBatchRequest,
     EmbeddingBatchResponse,
     EmbeddingMetrics,
     compute_vector_checksum,
@@ -283,7 +284,7 @@ class EmbeddingPipeline:
 
         return [r for r in results if r is not None]
 
-    def embed_batch_request(self, request) -> EmbeddingBatchResponse:
+    def embed_batch_request(self, request: EmbeddingBatchRequest) -> EmbeddingBatchResponse:
         """Process an EmbeddingBatchRequest schema."""
         start_time = time.perf_counter()
         embedded = self.embed_chunks(request.chunks, batch_size=request.batch_size)
@@ -317,6 +318,7 @@ class EmbeddingPipeline:
             vector_checksum=compute_vector_checksum(vector),
             validation_status=validation_status,
             metadata=chunk.metadata,
+            content=chunk.content,
             text_preview=chunk.content[:120].strip() if chunk.content else "",
         )
 

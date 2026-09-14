@@ -74,7 +74,6 @@ class AdaptiveRetriever(BaseRetriever):
             dense_wt = 0.5
             bm25_wt = 0.5
             adaptive_budget = 4000
-            target_category = target_category or "safety"
 
         elif intent.primary_intent == IntentType.MAINTENANCE_LOOKUP:
             adaptive_top_k = top_k or 15
@@ -82,7 +81,6 @@ class AdaptiveRetriever(BaseRetriever):
             dense_wt = 0.4
             bm25_wt = 0.6
             adaptive_budget = 3500
-            target_category = target_category or "maintenance"
 
         elif intent.primary_intent == IntentType.SPECIFICATION_LOOKUP:
             adaptive_top_k = top_k or 8
@@ -105,7 +103,6 @@ class AdaptiveRetriever(BaseRetriever):
             dense_wt = 0.6
             bm25_wt = 0.4
             adaptive_budget = 6000
-            target_category = target_category or "manuals"
 
         elif intent.primary_intent == IntentType.COMPARISON:
             adaptive_top_k = top_k or 20
@@ -131,7 +128,7 @@ class AdaptiveRetriever(BaseRetriever):
             top_k=adaptive_top_k,
             filters=filters,
             collection_name=collection_name,
-            category=target_category,
+            category=category,
             expansion_radius=adaptive_radius,
             token_budget=adaptive_budget,
             **kwargs,

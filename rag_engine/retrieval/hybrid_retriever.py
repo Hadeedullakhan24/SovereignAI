@@ -144,8 +144,6 @@ class HybridRetriever(BaseRetriever):
         candidate_k = max(20, top_k * 2)
 
         target_category = category
-        if not target_category and not (intent.entities.equipment_tags or intent.entities.standards):
-            target_category = intent.preferred_category
 
         # 4. Dense Retrieval
         t_dense_start = time.perf_counter()

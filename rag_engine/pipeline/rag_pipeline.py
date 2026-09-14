@@ -41,15 +41,23 @@ from datetime import datetime, timezone
 import json
 import logging
 import time
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from rag_engine.generation.generation_config import GenerationConfig
 from rag_engine.generation.generation_pipeline import (
     GenerationPipeline,
     GenerationResponse,
 )
-from rag_engine.generation.prompt.prompt_templates import PromptArchetype
-from rag_engine.retrieval.base_retriever import CitationBundle, RetrievalResult
+from rag_engine.generation.prompt.prompt_templates import (
+    PromptArchetype,
+    detect_task_type,
+)
+from rag_engine.generation.response_formatter import ResponseFormatter
+from rag_engine.retrieval.base_retriever import (
+    CitationBundle,
+    RetrievalResult,
+    ScoredRetrievalChunk,
+)
 from rag_engine.retrieval.retrieval_pipeline import RetrievalPipeline
 
 logger = logging.getLogger(__name__)
@@ -116,39 +124,92 @@ class RAGResponse:
         return srcs
 
     def format_cli_output(self) -> str:
-        """Render a clean, human-readable terminal output for CLI question-answering."""
-        lines = []
-        lines.append("=" * 80)
-        lines.append("MRPL SOVEREIGN AGENTIC AI WORKBENCH - ANSWER")
-        lines.append("=" * 80)
-        lines.append(f"\nQuestion: {self.query}")
-        lines.append(f"\nAnswer:\n{self.answer.strip()}\n")
+        """Render a clean, human-readable terminal output adhering strictly to:
+        USER RESULT FIRST -> EVIDENCE SECOND -> TECHNICAL DETAILS LAST.
+        """
+        detected = detect_task_type(self.query)
+        header_map = {
+            PromptArchetype.EMAIL: "GENERATED EMAIL",
+            PromptArchetype.APPROVAL_NOTE: "GENERATED APPROVAL NOTE",
+            PromptArchetype.REPORT: "GENERATED REPORT",
+            PromptArchetype.SUMMARY: "GENERATED SUMMARY",
+            PromptArchetype.COMPARISON: "GENERATED COMPARISON",
+            PromptArchetype.EXTRACTION: "GENERATED EXTRACTION",
+            PromptArchetype.SAFETY_COMPLIANCE: "GENERATED SAFETY REQUIREMENTS",
+            PromptArchetype.SOP_RETRIEVAL: "GENERATED PROCEDURE",
+            PromptArchetype.PROCEDURE: "GENERATED PROCEDURE",
+            PromptArchetype.SPECIFICATION: "GENERATED SPECIFICATION",
+            PromptArchetype.EQUIPMENT_LOOKUP: "GENERATED SPECIFICATION",
+            PromptArchetype.MAINTENANCE: "GENERATED MAINTENANCE SUMMARY" if "summary" in self.query.lower() else "GENERATED ANSWER",
+            PromptArchetype.TROUBLESHOOTING: "GENERATED TROUBLESHOOTING",
+            PromptArchetype.ANALYSIS: "GENERATED ANALYSIS",
+            PromptArchetype.GENERAL_QA: "GENERATED ANSWER",
+        }
 
-        # Supporting Citations
-        lines.append("-" * 80)
-        lines.append("Supporting Citations:")
-        if self.citations:
-            for c in self.citations:
-                tag_str = f" [Tag: {c.equipment_tag}]" if c.equipment_tag else ""
-                page_str = f" (Page {c.page_number})" if c.page_number else ""
-                section_str = f" - Section: {c.section_title}" if c.section_title else ""
-                lines.append(f"  {c.citation_id} {c.document_name or c.document_id}{page_str}{section_str}{tag_str}")
-                if c.verbatim_quote:
-                    lines.append(f"      \"{c.verbatim_quote.strip()}\"")
+        clean_ans = ResponseFormatter.strip_provenance(self.answer)
+        if "insufficient information" in clean_ans.lower() or "insufficient evidence" in clean_ans.lower() or not self.is_grounded:
+            section_title = "GENERATED RESULT"
         else:
-            lines.append("  (No citations referenced)")
+            section_title = header_map.get(detected, "GENERATED ANSWER")
 
-        # Metadata Summary
+        lines: list[str] = []
+        lines.append("=" * 80)
+        lines.append(f"MRPL SOVEREIGN AGENTIC AI WORKBENCH - {section_title}")
+        lines.append("=" * 80)
+        lines.append(f"Question: {self.query}\n")
+
+        # --------------------------------------------------
+        # SECTION 1: USER RESULT FIRST
+        # --------------------------------------------------
         lines.append("-" * 80)
-        lines.append("Execution & Confidence Summary:")
+        lines.append(f"{section_title}")
+        lines.append("-" * 80)
+        lines.append(clean_ans.strip())
+        lines.append("")
+
+        # --------------------------------------------------
+        # SECTION 2: SOURCES / EVIDENCE SECOND
+        # --------------------------------------------------
+        lines.append("-" * 80)
+        lines.append("SOURCES / EVIDENCE")
+        lines.append("-" * 80)
+        if self.citations:
+            for idx, c in enumerate(self.citations, 1):
+                anchor = getattr(c, "citation_id", f"[{idx}]")
+                doc = getattr(c, "document_name", None) or getattr(c, "document_id", "Document")
+                page = f"Page {c.page_number}" if getattr(c, "page_number", None) else None
+                section = f"Section: {c.section_title}" if getattr(c, "section_title", None) else None
+                tag = f"Tag: {c.equipment_tag}" if getattr(c, "equipment_tag", None) else None
+
+                meta_parts = [p for p in [page, section, tag] if p]
+                meta_str = f" ({' | '.join(meta_parts)})" if meta_parts else ""
+
+                lines.append(f"  {anchor} {doc}{meta_str}")
+                if getattr(c, "verbatim_quote", None):
+                    quote = c.verbatim_quote.strip().replace("\n", " ")
+                    if len(quote) > 160:
+                        quote = quote[:157] + "..."
+                    lines.append(f'      "{quote}"')
+        else:
+            lines.append("  (No citations referenced or required)")
+        lines.append("")
+
+        # --------------------------------------------------
+        # SECTION 3: AI / RAG DETAILS LAST
+        # --------------------------------------------------
+        lines.append("-" * 80)
+        lines.append("AI / RAG DETAILS")
+        lines.append("-" * 80)
         lines.append(f"  - Confidence Score    : {self.confidence_score * 100:.1f}%")
         lines.append(f"  - Factual Grounding   : {'Grounded' if self.is_grounded else 'Warning: Low Grounding'}")
-        lines.append(f"  - Total RAG Latency   : {self.total_latency_ms:.2f} ms")
         if self.execution_trace:
-            lines.append(f"  - Generation Time     : {self.execution_trace.generation_time_ms:.2f} ms")
-            lines.append(f"  - Prompt Tokens       : {self.execution_trace.prompt_tokens}")
             lines.append(f"  - Retrieved Chunks    : {self.execution_trace.retrieved_chunks}")
-        lines.append(f"  - Model Used          : {self.model_used}")
+        elif getattr(self.retrieval_result, "candidates", None):
+            lines.append(f"  - Retrieved Chunks    : {len(self.retrieval_result.candidates)}")
+        lines.append(f"  - Model Used          : {self.model_used or 'qwen2.5-1.5b-instruct'}")
+        if self.execution_trace and self.execution_trace.generation_time_ms is not None:
+            lines.append(f"  - Generation Time     : {self.execution_trace.generation_time_ms:.2f} ms")
+        lines.append(f"  - Total RAG Latency   : {self.total_latency_ms:.2f} ms")
         lines.append("=" * 80)
         return "\n".join(lines)
 
@@ -339,12 +400,17 @@ class RAGPipeline:
             )
 
         # 3. Generation Phase (Milestone 9)
+        effective_archetype = (
+            detect_task_type(question)
+            if archetype in (PromptArchetype.GENERAL_QA, "general_qa")
+            else archetype
+        )
         generation_start = time.perf_counter()
         generation_response = self.generation.generate(
             query=question,
             retrieval_result=retrieval_result,
             session_id=session_id,
-            archetype=archetype,
+            archetype=effective_archetype,
         )
         generation_ms = (time.perf_counter() - generation_start) * 1000.0
 
