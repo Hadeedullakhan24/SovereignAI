@@ -37,16 +37,20 @@ class IndexManager:
         payload_validator: Optional[PayloadValidator] = None,
         tx_manager: Optional[TransactionManager] = None,
         reconciler: Optional[IncrementalIndexer] = None,
-        manifest_path: Path = Path("vector_db/index_manifest.json"),
+        manifest_path: Optional[Path] = None,
     ) -> None:
         self.store = store
         self.batch_size = batch_size
         self.router = router or CollectionRouter()
         self.schema_validator = schema_validator or SchemaValidator()
         self.payload_validator = payload_validator or PayloadValidator()
-        self.tx_manager = tx_manager or TransactionManager(store)
+        store_config = getattr(store, "config", None)
+        journal_dir = getattr(store_config, "journal_path", None)
+        self.tx_manager = tx_manager or TransactionManager(store, journal_dir=journal_dir) if journal_dir else TransactionManager(store)
         self.reconciler = reconciler or IncrementalIndexer(store)
-        self.manifest_path = manifest_path
+        self.manifest_path = manifest_path or (
+            getattr(store_config, "storage_path", Path("vector_db/qdrant")).parent / "index_manifest.json"
+        )
 
     def index_document_chunks(
         self,

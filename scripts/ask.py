@@ -92,15 +92,18 @@ def run_interactive_repl(
                 }
                 print(json.dumps(output_dict, indent=2))
             elif stream:
+                from agent.router import get_router, Capability
+                decision = get_router().route(query)
                 from rag_engine.generation.prompt.task_intent import TaskClassifier
                 intent = TaskClassifier.classify(query)
-                if intent.is_artifact_request:
+                if intent.is_artifact_request or decision.capability == Capability.IMAGE_GENERATION:
                     print("\nAssistant")
                     response = pipeline.answer(
                         question=query,
                         session_id=session_id,
                         archetype=archetype,
                         top_k=top_k,
+                        decision=decision,
                     )
                     if debug:
                         print(response.format_cli_output(detailed=True))
@@ -329,9 +332,11 @@ def main(args_list: list[str] | None = None) -> None:
             )
             print(response.format_cli_output(detailed=True))
         elif args.stream:
+            from agent.router import get_router, Capability
+            decision = get_router().route(query)
             from rag_engine.generation.prompt.task_intent import TaskClassifier
             intent = TaskClassifier.classify(query)
-            if intent.is_artifact_request:
+            if intent.is_artifact_request or decision.capability == Capability.IMAGE_GENERATION:
                 print_banner()
                 print(f"\nYou\n> {query}")
                 print("\nAssistant")
@@ -340,6 +345,7 @@ def main(args_list: list[str] | None = None) -> None:
                     session_id=args.session_id,
                     archetype=archetype,
                     top_k=args.top_k,
+                    decision=decision,
                 )
                 print(response.format_clean_cli_output())
             else:

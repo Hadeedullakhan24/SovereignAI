@@ -283,9 +283,15 @@ class EvidenceSelector:
         candidates: Sequence[ScoredRetrievalChunk],
         citations: Sequence[CitationBundle],
         is_artifact_request: bool = False,
+        exact_entity_only: bool = False,
+        requested_source_names: Sequence[str] = (),
     ) -> EvidencePackage:
         by_chunk = {c.chunk_id: c for c in citations}
         requested = _identifiers(query)
+        requested_sources = {
+            re.sub(r"\s+", " ", name).strip().casefold()
+            for name in requested_source_names if name and "." in name
+        }
         q_terms = _terms(query)
         seen: set[tuple[str, str, int | None]] = set()
         items: list[EvidenceItem] = []
@@ -320,6 +326,16 @@ class EvidenceSelector:
                 sha256=meta.sha256,
             )
 
+            # An explicitly named file is an exact provenance constraint.  A
+            # semantically similar report must never stand in for it.
+            document_name = (citation.document_name or meta.document_name or "").casefold()
+            if requested_sources and document_name not in requested_sources:
+                items.append(EvidenceItem(
+                    EvidenceRelation.UNRELATED, candidate, citation, (),
+                    "candidate does not match explicitly requested source filename",
+                ))
+                continue
+
             key = (citation.document_id, re.sub(r"\s+", " ", source).casefold(), citation.page_number)
             if key in seen:
                 continue
@@ -350,7 +366,10 @@ class EvidenceSelector:
                     relation = EvidenceRelation.RELATED
                     reason = "explicit query identifier matches entity with low semantic overlap"
             elif requested and not entities:
-                if is_normative:
+                if exact_entity_only:
+                    relation = EvidenceRelation.UNRELATED
+                    reason = "exact entity mode rejects evidence without matching entity provenance"
+                elif is_normative:
                     if overlap >= 0.20 or candidate.score >= 0.65:
                         relation = EvidenceRelation.GENERIC_REQUIREMENT
                         reason = "general normative standard matches query topic"
@@ -396,6 +415,12 @@ class EvidenceSelector:
         # and only scattered generic documents are found, reject scope creation to prevent hallucinated reports.
         is_scope_ok = True
         if is_artifact_request and not requested and not has_direct_or_related:
+            is_scope_ok = False
+
+        # If the request named a file, successful evidence selection requires
+        # evidence from that file.  This turns "refer to X.pdf" into a hard
+        # execution requirement rather than a prompt-only suggestion.
+        if requested_sources and not has_direct_or_related and not has_generic:
             is_scope_ok = False
 
         return EvidencePackage(

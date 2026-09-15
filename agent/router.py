@@ -191,6 +191,9 @@ _ROUTING_RULES: List[Tuple[TaskType, Capability, PromptArchetype, List[str]]] = 
         Capability.VISION,
         PromptArchetype.GENERAL_QA,
         [
+            "image", "photo", "picture", "diagram", "p&id", "pid diagram",
+            "drawing", "drawings", "scan", "scanned", "scans", "ocr", "handwritten", "sketch", "schematic",
+            "visual", "plate label", "nameplate", "photograph", "photographs", "weld defects",
             "ocr", "scan", "scanned document", "handwritten", "nameplate",
             "plate label", "read text from image", "extract text from image",
             "image text", "ocr table", "invoice scan", "inspection report scan",
@@ -379,7 +382,7 @@ class TaskRouter:
         """
         normalized = self._normalize(task)
 
-        task_type, capability, archetype, matched = self._match_rules(normalized)
+        capability, archetype, matched = self._match_rules(normalized)
 
         # Resolve execution tool and RAG context requirement
         tool_name, use_rag_context = self._resolve_tool(task_type, capability, task=normalized)
@@ -426,7 +429,7 @@ class TaskRouter:
                     if re.search(pattern, normalized):
                         hits.append(kw)
                 else:
-                    if kw.lower() in normalized:
+                    if re.search(rf"\b{re.escape(kw.lower())}\b", normalized):
                         hits.append(kw)
             if hits:
                 return task_type, capability, archetype, hits
