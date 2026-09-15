@@ -72,7 +72,7 @@ _SYSTEM_PREAMBLE = (
     "Your objective is to provide precise, direct, well-structured, and strictly evidence-grounded answers.\n"
     "CRITICAL OPERATIONAL RULES:\n"
     "1. DIRECT ANSWER FIRST: Directly answer the user's core question in the opening sentence without fluff, conversational filler, or preambles.\n"
-    "2. STRICT GROUNDING: Answer solely using the verified documentation provided in the CONTEXT section. Use only facts explicitly supported by retrieved evidence.\n"
+    "2. STRICT GROUNDING: Answer solely using the verified documentation provided in the CONTEXT section. Use only facts explicitly supported by retrieved evidence. Never invent, infer, or mention equipment tags, dates, or parameters not explicitly documented in the CONTEXT.\n"
     "3. SYNTHESIS & RELEVANCE: Synthesize and combine details across multiple relevant chunks when necessary. Do not simply copy or dump the first retrieved chunk. Avoid irrelevant retrieved material that does not directly address the query.\n"
     "4. STRUCTURE & HEADINGS: Use clear markdown headings, concise paragraphs, and bullet points (•) where appropriate for readability.\n"
     "5. NO INTERNAL RAG/ENGINE JARGON: Never mention embeddings, Qdrant, vector databases, BM25, RRF, reranking, chunks, retrieval latency, or internal execution metadata to the end user.\n"
@@ -93,14 +93,15 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         system_instruction=(
             f"{_SYSTEM_PREAMBLE}\n\n"
             "OPERATING FOCUS: Equipment Specifications & Tag Attributes.\n"
-            "Extract exact design operating pressures, temperatures, metallurgy, flow rates, and tag numbers."
+            "Extract exact design operating pressures, temperatures, metallurgy, flow rates, and tag numbers.\n"
+            "Never invent or mention ungrounded equipment tags, units, or parameters."
         ),
         generation_instruction=(
             "Structure your answer with:\n"
             "1. Equipment Tag & Unit identification.\n"
             "2. Direct verified technical parameters and operating limits with citations [n].\n"
             "3. If a requested parameter is not documented in the context, explicitly state that it is not specified in the available records.\n"
-            "Do NOT append a References or Bibliography section."
+            "Do NOT invent unmentioned equipment tags or append a References or Bibliography section."
         ),
     ),
     PromptArchetype.SPECIFICATION: PromptTemplate(
@@ -215,20 +216,25 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         system_instruction=(
             f"{_SYSTEM_PREAMBLE}\n\n"
             "OPERATING FOCUS: Professional Email Drafting.\n"
-            "Draft a professional, well-structured business email based solely on retrieved documentation."
+            "Draft a professional, well-structured business email strictly matching the requested communicative purpose (summary, notification, approval request, confirmation request, or action request) based solely on retrieved documentation."
         ),
         generation_instruction=(
-            "Draft a clean, professional email adhering strictly to retrieved facts:\n"
-            "Subject: [Concise and informative subject line]\n\n"
-            "Dear [Recipient / Team / Management],\n\n"
-            "[Body paragraphs explaining background, equipment condition, and exact proposed/required scope]\n\n"
+            "Draft a clean, professional email adhering strictly to retrieved facts and the user's specific requested purpose:\n"
+            "Subject: [Concise and informative subject line matching intent]\n\n"
+            "Dear [Designated Recipient / Team],\n\n"
+            "[Body paragraphs communicating the exact scope and facts requested]\n\n"
             "Best regards,\n"
             "[Engineering / Operations Team]\n\n"
-            "EMAIL FORMATTING RULES:\n"
+            "EMAIL TASK & SCOPE RULES:\n"
             "- Do NOT include bracket citations [n], bibliography, or debug tokens in the email body.\n"
             "- Do NOT claim files or attachments are attached unless confirmed in the evidence.\n"
-            "- Preserve exact status: If the request asks for an email regarding a proposed action, draft it as requesting approval for the proposed action.\n"
-            "- If the user asks to state that maintenance is completed, but the documents do NOT confirm completion, DO NOT falsely claim completion. State clearly in the email that the records document a proposed/required scope but completion is not established, and request confirmation."
+            "- PRESERVE USER INTENT & EMAIL PURPOSE:\n"
+            "  * If drafting a SUMMARY email: Clearly communicate documented facts and requirements. DO NOT ask the recipient to confirm, approve, inspect, or take action unless explicitly requested.\n"
+            "  * If drafting an APPROVAL-REQUEST email: Clearly request authorization for the documented proposed scope.\n"
+            "  * If drafting a CONFIRMATION-REQUEST email: Request confirmation regarding documented records.\n"
+            "  * If drafting a NOTIFICATION email: Inform recipients without demanding approval or immediate action.\n"
+            "- PRESERVE RECIPIENT: Use the salutation matching the user's requested recipient (e.g. 'Dear Site Safety Team,'). Do NOT invent unrelated roles (e.g. Maintenance Manager).\n"
+            "- PRESERVE ENTITY SCOPE: If the query is a general topic (e.g. hot work safety requirements), do NOT turn the email or subject line into an equipment-specific message (e.g. E-330) unless explicitly requested."
         ),
     ),
     PromptArchetype.APPROVAL_NOTE: PromptTemplate(
@@ -271,16 +277,21 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
         system_instruction=(
             f"{_SYSTEM_PREAMBLE}\n\n"
             "OPERATING FOCUS: Technical & Inspection Reports.\n"
-            "Structure formal technical reports with executive summaries and findings."
+            "Structure formal technical reports strictly grounded in verified facts from the context."
         ),
         generation_instruction=(
-            "Structure the report with appropriate markdown sections:\n"
-            "# [Report Title]\n"
-            "## 1. Executive Summary\n"
-            "## 2. Technical Findings & Condition Assessment\n"
-            "## 3. Proposed Actions & Controls (preserving exact source status)\n"
-            "## 4. Conclusion & Recommendations\n"
-            "Do NOT append a References or Bibliography section."
+            "Structure the report with appropriate markdown headings based strictly on retrieved records:\n"
+            "# [Report Title matching Equipment / Topic]\n"
+            "## Executive Summary\n"
+            "## Documented Specifications & Parameters\n"
+            "## Documented Inspection Findings & Records\n"
+            "## Documented Maintenance & Controls\n"
+            "## Conclusion\n"
+            "STRICT REPORT RULES:\n"
+            "- Only report facts and parameters explicitly found in the retrieved evidence.\n"
+            "- If maintenance, inspection, or temperature details are not documented for an equipment, state clearly: 'Not documented in available records.'\n"
+            "- Do NOT invent hypothetical condition assessments, inspection dates, or temperatures.\n"
+            "- Do NOT append a References or Bibliography section."
         ),
     ),
     PromptArchetype.EXTRACTION: PromptTemplate(
@@ -332,57 +343,9 @@ TEMPLATES: Dict[PromptArchetype, PromptTemplate] = {
 
 def detect_task_type(query: str) -> PromptArchetype:
     """Classify user query into appropriate task archetype based on intent and keywords."""
-    q_lower = query.lower().strip()
-
-    # 1. Extraction / Required Fields / Template Details
-    if any(k in q_lower for k in ["what fields", "list all fields", "extract the following", "required fields", "fields are required", "fields required", "template requires", "in the template", "template fields", "approval note template"]):
-        return PromptArchetype.EXTRACTION
-
-    # 2. Email detection
-    if any(k in q_lower for k in ["draft an email", "write an email", "compose an email", "send an email", "draft email"]):
-        return PromptArchetype.EMAIL
-
-    # 3. Approval Note Drafting / Generation (only if explicitly asked to draft or create)
-    if any(k in q_lower for k in ["draft an approval note", "draft approval note", "prepare an approval note", "generate an approval note", "create an approval note", "write an approval note", "draft recommendation note"]):
-        return PromptArchetype.APPROVAL_NOTE
-
-    # 4. Report
-    if any(k in q_lower for k in ["prepare a report", "inspection report", "maintenance report", "generate a report", "write a report", "technical report"]):
-        return PromptArchetype.REPORT
-
-    # 5. Summary
-    if any(k in q_lower for k in ["summarize", "summary", "short summary", "brief summary", "overview"]):
-        return PromptArchetype.SUMMARY
-
-    # 6. Comparison
-    if any(k in q_lower for k in ["compare", "comparison", "differences between", "versus", " vs "]):
-        return PromptArchetype.COMPARISON
-
-    # 7. Safety / Compliance
-    if any(k in q_lower for k in ["safety requirements", "safety precautions", "hot work", "work permit", "ppe", "loto", "oisd-std-", "oisd", "safety standard", "statutory requirement"]):
-        return PromptArchetype.SAFETY_COMPLIANCE
-
-    # 8. Procedure / SOP
-    if any(k in q_lower for k in ["procedure", "sop", "steps to", "how to perform", "operational steps", "instructions for"]):
-        return PromptArchetype.SOP_RETRIEVAL
-
-    # 9. Technical Specifications / Equipment Lookup
-    if any(k in q_lower for k in ["design pressure", "design temperature", "operating pressure", "operating temperature", "rated capacity", "flow rate", "metallurgy", "specs of", "specification", "knockout drum"]):
-        return PromptArchetype.SPECIFICATION
-
-    # 10. Maintenance / Inspection
-    if any(k in q_lower for k in ["maintenance action", "maintenance recorded", "inspection action", "lubrication schedule", "overhaul"]):
-        return PromptArchetype.MAINTENANCE
-
-    # 11. Troubleshooting / RCA
-    if any(k in q_lower for k in ["troubleshoot", "root cause", "failure mode", "diagnostic check", "abnormal vibration"]):
-        return PromptArchetype.TROUBLESHOOTING
-
-    # 12. Document Analysis
-    if any(k in q_lower for k in ["analyze this", "review the inspection", "what does this document establish", "document analysis"]):
-        return PromptArchetype.ANALYSIS
-
-    return PromptArchetype.GENERAL_QA
+    from rag_engine.generation.prompt.task_intent import TaskIntentClassifier
+    intent = TaskIntentClassifier.classify(query)
+    return intent.archetype
 
 
 class PromptTemplateRegistry:

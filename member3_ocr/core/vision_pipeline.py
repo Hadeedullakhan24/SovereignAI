@@ -1209,11 +1209,9 @@ class LocalQwenVisionBackend(LocalVisionBackendBase):
             self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_path_str,
                 torch_dtype=load_dtype,
-                device_map=self._device_used,
                 local_files_only=True,
                 low_cpu_mem_usage=True,
-            )
-            self._model.eval()
+            ).to(self._device_used).eval()
         except Exception as exc:
             raise VisionBackendUnavailableError(
                 f"Failed to load Qwen2.5-VL model from '{model_path_str}': {exc}"
@@ -1277,8 +1275,10 @@ class LocalQwenVisionBackend(LocalVisionBackendBase):
         scene_type, _, equip, obs, vis_txt, confidence = _parse_understanding_response(
             understanding_raw, image_id=image_id
         )
-        caption_raw = self._run_vqa(image_pil, _PROMPT_CAPTION)
-        caption_text = _parse_caption_response(caption_raw)
+        # One model generation per image request.  The understanding prompt
+        # carries enough grounded description to provide the concise caption;
+        # a second caption-only generation previously duplicated Qwen work.
+        caption_text = _parse_caption_response(understanding_raw)
 
         classifications = (
             ClassificationResult(label=scene_type, confidence=_clamp_confidence(confidence)),
@@ -1308,7 +1308,8 @@ class LocalQwenVisionBackend(LocalVisionBackendBase):
                 "observations": [{"description": o.description, "confidence": o.confidence,
                                   "uncertainty": o.uncertainty} for o in obs],
                 "visible_text": [{"text": t.text, "confidence": t.confidence} for t in vis_txt],
-                "understanding_raw": understanding_raw, "caption_raw": caption_raw,
+                "understanding_raw": understanding_raw,
+                "inference_count": 1,
                 "device_used": self._device_used, "device_requested": self._device_requested,
                 "model_name": "qwen2.5-vl-3b-instruct",
                 "model_path": str(self.config.model_path or self._DEFAULT_MODEL_PATH),

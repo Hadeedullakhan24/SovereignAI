@@ -140,6 +140,26 @@ models:
       Member 3 Sovereign Multimodal OCR & Document Processor for P&ID drawings,
       equipment nameplates, and scanned inspection reports. Runs 100% offline.
 
+  # -- Stable Diffusion local text-to-image generator (Phase 3) ------------
+  - role: image_generation
+    name: stable-diffusion-v1-5
+    hf_repo_id: runwayml/stable-diffusion-v1-5
+    local_path: models/diffusion/stable-diffusion-v1-5
+    family: stable_diffusion
+    context_window: 77
+    quantization: fp16
+    model_type: diffusion_pipeline
+    capabilities: [image_generation, text_to_image, industrial_diagram_generation, visual_synthesis]
+    supported_tasks: [text_to_image, diagram_generation, schematic_rendering]
+    runtime: diffusers_local
+    device_requirements: {minimum_vram_gb: 4, preferred_device: cuda}
+    priority: 10
+    enabled: true
+    description: >
+      Local Stable Diffusion 1.5 text-to-image diffusion pipeline. Staged locally
+      under models/diffusion/stable-diffusion-v1-5. Loaded lazily by
+      DiffusionImageGenerator and executed via ToolExecutor image_generator.
+
 # -- Embedding model (used by Member 1's retrieval -- read-only reference) --
 embedding:
   hf_repo_id: BAAI/bge-small-en-v1.5
@@ -149,3 +169,17 @@ embedding:
     BGE Small EN v1.5. Loaded by Member 1's EmbeddingPipeline.
     Declared here for documentation / health-check purposes only;
     the agent does NOT load this model directly.
+
+# -- Dedicated image/text embedding space (Phase 2; manually staged only) ---
+vision_embedding:
+  name: openclip-vit-b-32
+  architecture: ViT-B-32
+  local_path: models/vision/openclip-vit-b-32
+  weights_file: open_clip_pytorch_model.bin
+  dimensions: 512
+  runtime: open_clip_local
+  allow_downloads: false
+  description: >
+    Local shared image/text embedding model for mrpl_vision_v1. It is separate
+    from BGE text embeddings and Qwen visual reasoning. Weights are not yet
+    staged and must never be downloaded by runtime code.

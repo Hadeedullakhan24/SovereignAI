@@ -297,8 +297,8 @@ def test_prompt_health_monitor_canaries():
 
     assert report.is_healthy
     assert report.status == "HEALTHY"
-    assert report.templates_count == 7
-    assert len(report.archetypes_healthy) == 7
+    assert report.templates_count == len(PromptArchetype)
+    assert len(report.archetypes_healthy) == len(PromptArchetype)
     assert report.canary_latency_ms > 0.0
 
 

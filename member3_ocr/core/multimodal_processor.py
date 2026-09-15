@@ -1073,6 +1073,42 @@ class MultimodalProcessor:
             "routing_reasoning": signals.get("reasoning", ""),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        # Keep the structured VisionResult provenance available even when it is
+        # deliberately fused into DrawingAnalysisRecord rather than represented
+        # as a non-drawing VisionAnalysisRecord.
+        if active_vision is not None:
+            vision_backend = active_vision.backend
+            metadata["vision"] = {
+                "requested": self.config.enable_vision,
+                "executed": True,
+                "success": active_vision.success,
+                "analysis_kind": (
+                    "visual_inspection" if vision_rec is not None
+                    else "drawing_fusion" if drawing_rec is not None
+                    else "vision_result"
+                ),
+                "resolved_image_path": str(Path(active_vision.source_path).resolve()),
+                "image_dimensions": (active_vision.image_width, active_vision.image_height),
+                "backend": vision_backend.name if vision_backend else "unknown",
+                "model_name": active_vision.model_name,
+                "model_path": active_vision.model_path,
+                "device": active_vision.device_used,
+                "caption": active_vision.caption[:1000],
+                # A precomputed VisionResult may have been supplied by a caller;
+                # report its own count rather than claiming this orchestrator ran it.
+                "inference_count": int(active_vision.processing_metadata.get("inference_count", 0)),
+                "provenance": dict(active_vision.provenance),
+            }
+        else:
+            metadata["vision"] = {
+                "requested": self.config.enable_vision,
+                "executed": False,
+                "success": False,
+                "analysis_kind": "none",
+                "resolved_image_path": str(Path(source_path).resolve()),
+                "image_dimensions": (orig_w, orig_h),
+                "inference_count": 0,
+            }
 
         modality_statuses = {
             "ocr": "success" if active_ocr and not active_ocr.errors else ("failed" if any(e.stage == "ocr" for e in errors) else "skipped"),

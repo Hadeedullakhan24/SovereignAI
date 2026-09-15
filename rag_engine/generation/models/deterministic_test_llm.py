@@ -110,7 +110,14 @@ class DeterministicTestLLM(BaseLocalLLM):
                 )
 
         # Tokenize question (exclude common stopwords)
+        from rag_engine.generation.prompt.task_intent import (
+            EmailPurpose,
+            OutputFormat,
+            TaskIntentClassifier,
+        )
         from rag_engine.retrieval.retrieval_utils import QUERY_STOPWORDS, tokenize_refinery_text
+
+        intent = TaskIntentClassifier.classify(question)
         q_tokens = set(t for t in tokenize_refinery_text(question) if t not in QUERY_STOPWORDS and len(t) > 1)
 
         # Score and rank sentences across all cited chunks
@@ -151,7 +158,53 @@ class DeterministicTestLLM(BaseLocalLLM):
         # Sort by relevance score descending
         scored_sentences.sort(key=lambda x: x[0], reverse=True)
 
-        # Collect top distinct matching sentences
+        # If email format is requested, render formatted email without bracket citations
+        if intent.output_format == OutputFormat.EMAIL:
+            email_points: list[str] = []
+            seen_email_texts: set[str] = set()
+            for score, sent, cit_id in scored_sentences:
+                normalized_core = re.sub(r"[^a-zA-Z0-9]", "", sent[:40].lower())
+                if normalized_core in seen_email_texts:
+                    continue
+                seen_email_texts.add(normalized_core)
+                clean_pt = re.sub(r"\[\d+\]", "", sent).strip()
+                if not clean_pt.endswith((".", "!", "?", ";", ":")):
+                    clean_pt += "."
+                email_points.append(f"• {clean_pt}")
+                if len(email_points) >= 3:
+                    break
+
+            salutation = f"Dear {intent.recipient or 'Team'},"
+            if intent.email_purpose == EmailPurpose.SUMMARY:
+                subj = f"Subject: {intent.subject_topic} — Summary" if intent.subject_topic else "Subject: Summary of Requirements"
+                intro = f"Please find below a summary of the documented {intent.subject_topic.lower() if intent.subject_topic else 'safety requirements'}:"
+            elif intent.email_purpose == EmailPurpose.APPROVAL_REQUEST:
+                subj = f"Subject: Request for Approval — {intent.subject_topic}" if intent.subject_topic else "Subject: Request for Approval"
+                intro = f"Please review and provide authorization for the following documented scope:"
+            elif intent.email_purpose == EmailPurpose.CONFIRMATION_REQUEST:
+                subj = f"Subject: Request for Confirmation — {intent.subject_topic}" if intent.subject_topic else "Subject: Request for Confirmation"
+                intro = f"Please confirm the following documented details:"
+            elif intent.email_purpose == EmailPurpose.NOTIFICATION:
+                subj = f"Subject: Notification — {intent.subject_topic}" if intent.subject_topic else "Subject: Notification"
+                intro = f"This is to inform the team regarding the following documented information:"
+            elif intent.email_purpose == EmailPurpose.ACTION_REQUEST:
+                subj = f"Subject: Action Required — {intent.subject_topic}" if intent.subject_topic else "Subject: Action Required"
+                intro = f"Please take required action in accordance with the following documented requirements:"
+            else:
+                subj = f"Subject: {intent.subject_topic}" if intent.subject_topic else "Subject: Operations Update"
+                intro = f"Please find below the documented information:"
+
+            body_pts = "\n".join(email_points) if email_points else "• Documented details are outlined in the source records."
+            return (
+                f"{subj}\n\n"
+                f"{salutation}\n\n"
+                f"{intro}\n\n"
+                f"{body_pts}\n\n"
+                f"Best regards,\n"
+                f"[Engineering Team]"
+            )
+
+        # Collect top distinct matching sentences for direct QA
         selected: list[str] = []
         seen_texts: set[str] = set()
 

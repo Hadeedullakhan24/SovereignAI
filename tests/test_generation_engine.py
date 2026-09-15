@@ -248,33 +248,32 @@ def test_conversation_memory_sliding_window():
 # 4. Generation Cache Tests
 # --------------------------------------------------------------------------
 
-def test_generation_cache_persistence_and_ttl():
+def test_generation_cache_persistence_and_ttl(tmp_path: Path):
     """Verify SQLite WAL caching with deterministic hash keys."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test_gen_cache.db"
-        cache = GenerationCache(db_path=db_path, default_ttl_seconds=10)
+    db_path = tmp_path / "test_gen_cache.db"
+    cache = GenerationCache(db_path=db_path, default_ttl_seconds=10)
 
-        key = GenerationCache.compute_cache_key(
-            prompt_hash="abc123hash",
-            chunk_ids=["chk_1", "chk_2"],
-            model_name="deterministic_test",
-        )
+    key = GenerationCache.compute_cache_key(
+        prompt_hash="abc123hash",
+        chunk_ids=["chk_1", "chk_2"],
+        model_name="deterministic_test",
+    )
 
-        assert cache.get(key) is None
+    assert cache.get(key) is None
 
-        cache.put(
-            cache_key=key,
-            prompt_hash="abc123hash",
-            model_name="deterministic_test",
-            response_text="The operating pressure is 15.2 bar [1].",
-            citations=["[1]"],
-            metadata={"confidence": 0.95},
-        )
+    cache.put(
+        cache_key=key,
+        prompt_hash="abc123hash",
+        model_name="deterministic_test",
+        response_text="The operating pressure is 15.2 bar [1].",
+        citations=["[1]"],
+        metadata={"confidence": 0.95},
+    )
 
-        cached = cache.get(key)
-        assert cached is not None
-        assert "15.2 bar" in cached.response_text
-        assert cached.citations == ["[1]"]
+    cached = cache.get(key)
+    assert cached is not None
+    assert "15.2 bar" in cached.response_text
+    assert cached.citations == ["[1]"]
 
 
 # --------------------------------------------------------------------------
@@ -476,45 +475,45 @@ def test_streaming_manager_metrics():
 # 9. Pipeline End-to-End Tests
 # --------------------------------------------------------------------------
 
-def test_generation_pipeline_end_to_end_mock():
+def test_generation_pipeline_end_to_end_mock(tmp_path: Path):
     """Verify complete 11-stage GenerationPipeline from RetrievalResult to response."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test_pipeline_cache.db"
-        cfg = GenerationConfig(
-            default_model_name="deterministic_test",
-            cache_enabled=True,
-            cache_db_path=db_path,
-        )
-        pipeline = GenerationPipeline(config=cfg)
-        res = create_sample_retrieval_result()
+    db_path = tmp_path / "test_pipeline_cache.db"
+    cfg = GenerationConfig(
+        default_model_name="deterministic_test",
+        cache_enabled=True,
+        cache_db_path=db_path,
+    )
+    pipeline = GenerationPipeline(config=cfg)
+    res = create_sample_retrieval_result()
 
-        response = pipeline.generate(
-            query=res.query,
-            retrieval_result=res,
-            session_id="session_e2e",
-            archetype=PromptArchetype.EQUIPMENT_LOOKUP,
-        )
+    response = pipeline.generate(
+        query=res.query,
+        retrieval_result=res,
+        session_id="session_e2e",
+        archetype=PromptArchetype.EQUIPMENT_LOOKUP,
+    )
 
-        assert isinstance(response, GenerationResponse)
-        assert "15.2 bar" in response.answer
-        assert "### References & Provenance" in response.answer
-        assert response.confidence.composite_score > 0.70
-        assert not response.cache_hit
-        assert response.metrics.total_pipeline_latency_ms > 0.0
+    assert isinstance(response, GenerationResponse)
+    assert "15.2 bar" in response.answer
+    assert "### References & Provenance" in response.answer
+    assert response.confidence.composite_score > 0.70
+    assert not response.cache_hit
+    assert response.metrics.total_pipeline_latency_ms > 0.0
 
-        # Test cache hit on second run
-        cached_response = pipeline.generate(
-            query=res.query,
-            retrieval_result=res,
-            session_id="session_e2e",
-            archetype=PromptArchetype.EQUIPMENT_LOOKUP,
-        )
-        assert cached_response.cache_hit
+    # Test cache hit on second run
+    cached_response = pipeline.generate(
+        query=res.query,
+        retrieval_result=res,
+        session_id="session_e2e",
+        archetype=PromptArchetype.EQUIPMENT_LOOKUP,
+    )
+    assert cached_response.cache_hit
 
 
 def test_generation_pipeline_safety_rejection():
     """Verify adversarial query triggers SafetyViolationError."""
-    pipeline = GenerationPipeline()
+    cfg = GenerationConfig(default_model_name="deterministic_test")
+    pipeline = GenerationPipeline(config=cfg)
     res = create_sample_retrieval_result()
 
     with pytest.raises(SafetyViolationError):
@@ -526,7 +525,8 @@ def test_generation_pipeline_safety_rejection():
 
 def test_master_rag_pipeline_end_to_end():
     """Verify Master RAGPipeline combining Milestone 8 Retrieval + Milestone 9 Generation."""
-    rag = RAGPipeline()
+    cfg = GenerationConfig(default_model_name="deterministic_test")
+    rag = RAGPipeline(config=cfg)
     rag_response = rag.query(
         query="What is the design operating pressure of centrifugal pump P-203?",
         session_id="master_session_001",
@@ -540,7 +540,8 @@ def test_master_rag_pipeline_end_to_end():
 
 def test_generation_concurrency_thread_safety():
     """Verify GenerationPipeline is completely thread-safe under concurrent execution."""
-    pipeline = GenerationPipeline()
+    cfg = GenerationConfig(default_model_name="deterministic_test")
+    pipeline = GenerationPipeline(config=cfg)
     res = create_sample_retrieval_result()
 
     def _task(idx: int) -> GenerationResponse:
