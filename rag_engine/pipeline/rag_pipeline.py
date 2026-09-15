@@ -292,7 +292,7 @@ class RAGResponse:
             lines.append(f"  - Retrieved Chunks    : {self.execution_trace.retrieved_chunks}")
         elif getattr(self.retrieval_result, "candidates", None):
             lines.append(f"  - Retrieved Chunks    : {len(self.retrieval_result.candidates)}")
-        lines.append(f"  - Model Used          : {self.model_used or 'qwen2.5-1.5b-instruct'}")
+        lines.append(f"  - Model Used          : {self.model_used or 'local-llm'}")
         if self.execution_trace and self.execution_trace.generation_time_ms is not None:
             lines.append(f"  - Generation Time     : {self.execution_trace.generation_time_ms:.2f} ms")
         lines.append(f"  - Total RAG Latency   : {self.total_latency_ms:.2f} ms")
@@ -462,6 +462,107 @@ class RAGPipeline:
             self._generation = GenerationPipeline(config=self.config)
         return self._generation
 
+    def get_generation_pipeline(self, model_name: Optional[str] = None) -> GenerationPipeline:
+        """Lazily initialize or return configured GenerationPipeline for a given model."""
+        if not model_name or model_name.lower() == "auto":
+            return self.generation
+        if not hasattr(self, "_generation_pipelines"):
+            self._generation_pipelines: Dict[str, GenerationPipeline] = {}
+        key = model_name.strip().lower()
+        if key not in self._generation_pipelines:
+            cfg = GenerationConfig(default_model_name=model_name)
+            self._generation_pipelines[key] = GenerationPipeline(config=cfg)
+        return self._generation_pipelines[key]
+
+    def retrieve_context(
+        self,
+        question: str,
+        top_k: int = 5,
+        is_artifact_request: bool = False,
+    ) -> Dict[str, Any]:
+        """Model-independent pure retrieval contract for Member 1 -> Member 2 integration.
+
+        Performs:
+            Dense (Qdrant) + Sparse (BM25) -> RRF Fusion -> Cross-Encoder Reranking ->
+            Evidence Gating -> Context Packing -> Citations -> Retrieval Trace.
+
+        Returns structured dictionary containing:
+            query, context, citations, confidence, retrieval_trace, candidates, structured_report.
+        """
+        start_total = time.perf_counter()
+        intent = TaskClassifier.classify(question)
+        is_artifact = is_artifact_request or intent.is_artifact_request
+
+        retrieval_start = time.perf_counter()
+        retrieval_result = self.retrieval.retrieve(query=question, top_k=top_k)
+        retrieval_total_ms = (time.perf_counter() - retrieval_start) * 1000.0
+
+        rm = getattr(retrieval_result, "metrics", None)
+        dense_time = getattr(rm, "dense_latency_ms", 0.0) if rm else 0.0
+        sparse_time = getattr(rm, "sparse_latency_ms", 0.0) if rm else 0.0
+        fusion_time = getattr(rm, "fusion_latency_ms", 0.0) if rm else 0.0
+        rerank_time = getattr(rm, "rerank_latency_ms", 0.0) if rm else 0.0
+        packing_time = getattr(rm, "context_packing_latency_ms", 0.0) if rm else 0.0
+
+        candidates = getattr(retrieval_result, "candidates", [])
+        evidence_package = EvidenceSelector().select(
+            question,
+            candidates,
+            retrieval_result.citations,
+            is_artifact_request=is_artifact,
+        )
+        selected = evidence_package.selected
+        report_title = f"{intent.subject_topic.title()} Report" if intent.subject_topic else "Grounded Evidence Report"
+        structured_report = evidence_package.report(report_title)
+        filtered_result = retrieval_result.model_copy(update={
+            "scored_chunks": [item.chunk for item in selected],
+            "citations": list(evidence_package.citations),
+            "packed_context": evidence_package.context(),
+        })
+
+        is_report_valid, validation_errors = structured_report.validate()
+        insufficient_for_artifact = (
+            is_artifact
+            and (
+                not is_report_valid
+                or not structured_report.scope_established
+                or structured_report.missing_information
+                or not selected
+            )
+        )
+
+        has_sufficient = bool(selected) and self._has_sufficient_evidence(question, [item.chunk for item in selected]) and not insufficient_for_artifact
+        total_ms = (time.perf_counter() - start_total) * 1000.0
+
+        citations_list = list(evidence_package.citations)
+        confidence = 0.95 if has_sufficient else 0.20
+
+        trace = {
+            "question": question,
+            "embedding_model": "local-bge",
+            "dense_time_ms": round(dense_time, 2),
+            "sparse_time_ms": round(sparse_time, 2),
+            "fusion_time_ms": round(fusion_time, 2),
+            "rerank_time_ms": round(rerank_time, 2),
+            "context_packing_time_ms": round(packing_time, 2),
+            "retrieval_total_ms": round(total_ms, 2),
+            "retrieved_chunks": len(selected),
+            "confidence": confidence,
+        }
+
+        return {
+            "query": question,
+            "context": evidence_package.context(),
+            "citations": citations_list,
+            "confidence": confidence,
+            "retrieval_trace": trace,
+            "candidates": [item.chunk for item in selected],
+            "structured_report": structured_report,
+            "has_sufficient_evidence": has_sufficient,
+            "filtered_result": filtered_result,
+            "evidence_package": evidence_package,
+        }
+
     def _has_sufficient_evidence(
         self,
         question: str,
@@ -607,10 +708,23 @@ class RAGPipeline:
         session_id: str = "default_session",
         archetype: PromptArchetype | str = PromptArchetype.GENERAL_QA,
         top_k: int = 5,
+        model_name: Optional[str] = None,
     ) -> RAGResponse:
-        """Execute end-to-end RAG answer: Retrieval -> Prompting -> Generation -> Validation -> Trace."""
         start_total = time.perf_counter()
         intent = TaskClassifier.classify(question)
+        routed_model = model_name
+        if not routed_model or routed_model.lower() == "auto":
+            if self.config.default_model_name and self.config.default_model_name.lower() != "auto":
+                routed_model = self.config.default_model_name
+            else:
+                try:
+                    from agent.router import get_router
+                    decision = get_router().route(question)
+                    if decision.model_record:
+                        routed_model = decision.model_record.hf_repo_id
+                except Exception:
+                    routed_model = None
+        gen_pipeline = self.get_generation_pipeline(routed_model) if routed_model else self.generation
 
         # 0. Image Generation Route: bypass document text retrieval unless explicitly requested
         if intent.operation == TaskOperation.GENERATE_IMAGE or intent.artifact_format == ArtifactFormat.PNG:
@@ -760,12 +874,12 @@ class RAGPipeline:
         if not selected or not self._has_sufficient_evidence(question, [item.chunk for item in selected]) or insufficient_for_artifact:
             total_ms = (time.perf_counter() - start_total) * 1000.0
             # Construct synthetic GenerationResponse for fallback
-            prompt_payload = self.generation.prompt_builder.build_prompt(
+            prompt_payload = gen_pipeline.prompt_builder.build_prompt(
                 query=question,
                 candidates=[],
                 citations=[],
                 archetype=archetype,
-                model_name=self.generation.model.model_name,
+                model_name=gen_pipeline.model.model_name,
             )
             from rag_engine.generation.generation_metrics import GenerationMetrics
             from rag_engine.generation.guardrails.citation_validator import CitationValidationReport
@@ -793,7 +907,7 @@ class RAGPipeline:
                     unverified_entities=[],
                     is_grounded=True,
                 ),
-                confidence=self.generation.confidence_scorer.calculate(
+                confidence=gen_pipeline.confidence_scorer.calculate(
                     retrieval_confidence=0.0,
                     citation_precision=0.0,
                     grounding_score=1.0,
@@ -801,7 +915,7 @@ class RAGPipeline:
                 metrics=GenerationMetrics(
                     session_id=session_id,
                     query=question,
-                    model_name=self.generation.model.model_name,
+                    model_name=gen_pipeline.model.model_name,
                     prompt_tokens=0,
                     generated_tokens=len(INSUFFICIENT_EVIDENCE_FALLBACK.split()),
                 ),
@@ -821,7 +935,7 @@ class RAGPipeline:
                 retrieved_chunks=0,
                 confidence=fallback_conf,
                 total_latency_ms=round(total_ms, 2),
-                model_used=self.generation.model.model_name,
+                model_used=gen_pipeline.model.model_name,
             )
             return RAGResponse(
                 query=question,
@@ -833,7 +947,7 @@ class RAGPipeline:
                 confidence_score=fallback_conf,
                 is_grounded=True,
                 total_latency_ms=round(total_ms, 2),
-                model_used=self.generation.model.model_name,
+                model_used=gen_pipeline.model.model_name,
                 artifact=None,
                 execution_trace=trace,
                 evidence_package=evidence_package,
@@ -847,7 +961,7 @@ class RAGPipeline:
             else archetype
         )
         generation_start = time.perf_counter()
-        generation_response = self.generation.generate(
+        generation_response = gen_pipeline.generate(
             query=question,
             retrieval_result=filtered_result,
             session_id=session_id,
@@ -877,7 +991,7 @@ class RAGPipeline:
             retrieved_chunks=len(selected),
             confidence=generation_response.confidence.composite_score,
             total_latency_ms=round(total_ms, 2),
-            model_used=self.generation.model.model_name,
+            model_used=gen_pipeline.model.model_name,
         )
 
         return RAGResponse(
@@ -890,7 +1004,7 @@ class RAGPipeline:
             confidence_score=generation_response.confidence.composite_score,
             is_grounded=generation_response.grounding_report.is_grounded,
             total_latency_ms=round(total_ms, 2),
-            model_used=self.generation.model.model_name,
+            model_used=gen_pipeline.model.model_name,
             artifact=artifact,
             execution_trace=trace,
             evidence_package=evidence_package,
@@ -903,6 +1017,7 @@ class RAGPipeline:
         session_id: str = "default_session",
         archetype: PromptArchetype | str = PromptArchetype.GENERAL_QA,
         top_k: int = 5,
+        model_name: Optional[str] = None,
     ) -> RAGResponse:
         """Alias for answer() ensuring backward compatibility with existing tests and scripts."""
         return self.answer(
@@ -910,6 +1025,7 @@ class RAGPipeline:
             session_id=session_id,
             archetype=archetype,
             top_k=top_k,
+            model_name=model_name,
         )
 
     def stream_query(
@@ -918,6 +1034,7 @@ class RAGPipeline:
         session_id: str = "default_session",
         archetype: PromptArchetype | str = PromptArchetype.GENERAL_QA,
         top_k: int = 5,
+        model_name: Optional[str] = None,
     ) -> tuple[RetrievalResult, Iterator[str]]:
         """Stream RAG response tokens after performing retrieval."""
         effective_archetype = (
@@ -926,7 +1043,20 @@ class RAGPipeline:
             else archetype
         )
         retrieval_result = self.retrieval.retrieve(query=query, top_k=top_k)
-        stream = self.generation.stream_generate(
+        routed_model = model_name
+        if not routed_model or routed_model.lower() == "auto":
+            if self.config.default_model_name and self.config.default_model_name.lower() != "auto":
+                routed_model = self.config.default_model_name
+            else:
+                try:
+                    from agent.router import get_router
+                    decision = get_router().route(query)
+                    if decision.model_record:
+                        routed_model = decision.model_record.hf_repo_id
+                except Exception:
+                    routed_model = None
+        gen_pipeline = self.get_generation_pipeline(routed_model) if routed_model else self.generation
+        stream = gen_pipeline.stream_generate(
             query=query,
             retrieval_result=retrieval_result,
             session_id=session_id,
@@ -940,15 +1070,17 @@ class RAGPipeline:
         top_k: int = 5,
         archetype: PromptArchetype | str = PromptArchetype.GENERAL_QA,
         session_id: str = "default_session",
+        model_name: Optional[str] = None,
     ) -> Any:
         """Execute complete retrieval-to-prompt chain and return verified RetrievedPrompt."""
         retrieval_result = self.retrieval.retrieve(query=query, top_k=top_k)
-        history_text = self.generation.memory.get_history_text(session_id, max_turns=3)
-        return self.generation.prompt_builder.build_prompt(
+        gen_pipeline = self.get_generation_pipeline(model_name) if model_name else self.generation
+        history_text = gen_pipeline.memory.get_history_text(session_id, max_turns=3)
+        return gen_pipeline.prompt_builder.build_prompt(
             query=query,
             candidates=retrieval_result.candidates,
             citations=retrieval_result.citations,
             archetype=archetype,
             conversation_history=history_text,
-            model_name=self.generation.model.model_name,
+            model_name=gen_pipeline.model.model_name,
         )

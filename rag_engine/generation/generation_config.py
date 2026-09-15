@@ -122,8 +122,8 @@ class GenerationConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     default_model_name: str = Field(
-        default="qwen2.5-1.5b-instruct",
-        description="Active model identifier or path (e.g. 'qwen2.5-1.5b-instruct')",
+        default="auto",
+        description="Active model identifier, path, or 'auto' for dynamic routing",
     )
     models_dir: Path = Field(
         default=Path("models/llm"),

@@ -2032,21 +2032,20 @@ class ToolExecutor:
 
     def get_rag_pipeline(self, model_name: Optional[str] = None) -> RAGPipeline:
         """Lazily return or create a RAGPipeline for the target model."""
-        if not model_name:
+        if not model_name or model_name.strip().lower() == "auto":
             if self._rag_pipeline is None:
-                config = GenerationConfig(default_model_name="qwen2.5-1.5b")
+                config = GenerationConfig(default_model_name="auto")
                 self._rag_pipeline = RAGPipeline(config=config)
             return self._rag_pipeline
 
         key = model_name.strip().lower()
-        if "qwen" in key and self._rag_pipeline is not None:
-            return self._rag_pipeline
-
         if key not in self._rag_pipelines:
             if "phi" in key:
-                cfg_model = "phi-3.5-mini-instruct"
+                cfg_model = "microsoft/Phi-3.5-mini-instruct"
             elif "smol" in key:
-                cfg_model = "smollm2-1.7b-instruct"
+                cfg_model = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+            elif "qwen" in key:
+                cfg_model = "Qwen/Qwen2.5-1.5B-Instruct"
             else:
                 cfg_model = model_name
             config = GenerationConfig(default_model_name=cfg_model)

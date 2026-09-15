@@ -26,6 +26,13 @@ MODEL_SPECIFICATIONS: Dict[str, Dict[str, Any]] = {
         "default_quantization": "fp16",
         "local_folder": "TinyLlama_TinyLlama-1.1B-Chat-v1.0",
     },
+    "microsoft/Phi-3.5-mini-instruct": {
+        "family": "phi",
+        "description": "Phi 3.5 Mini Instruct (3.8B, Reasoning-optimized, 128k context)",
+        "context_window": 131072,
+        "default_quantization": "fp16",
+        "local_folder": "phi-3.5-mini-instruct",
+    },
     "microsoft/Phi-3-mini-4k-instruct": {
         "family": "phi3",
         "description": "High-efficiency 3.8B model with strong technical reasoning",
@@ -33,10 +40,17 @@ MODEL_SPECIFICATIONS: Dict[str, Dict[str, Any]] = {
         "default_quantization": "fp16",
         "local_folder": "microsoft_Phi-3-mini-4k-instruct",
     },
+    "HuggingFaceTB/SmolLM2-1.7B-Instruct": {
+        "family": "smollm",
+        "description": "SmolLM2 1.7B Instruct (Compact, Fast, 8k context)",
+        "context_window": 8192,
+        "default_quantization": "fp16",
+        "local_folder": "smollm2-1.7b-instruct",
+    },
     "Qwen/Qwen2.5-1.5B-Instruct": {
         "family": "qwen",
         "description": "Lightweight 1.5B model with structured output capability",
-        "context_window": 4096,
+        "context_window": 32768,
         "default_quantization": "fp16",
         "local_folder": "qwen2.5-1.5b-instruct",
     },
@@ -83,6 +97,14 @@ MODEL_ALIASES: Dict[str, str] = {
     "phi3": "microsoft/Phi-3-mini-4k-instruct",
     "phi-3": "microsoft/Phi-3-mini-4k-instruct",
     "phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
+    "phi3.5": "microsoft/Phi-3.5-mini-instruct",
+    "phi-3.5": "microsoft/Phi-3.5-mini-instruct",
+    "phi-3.5-mini": "microsoft/Phi-3.5-mini-instruct",
+    "phi-3.5-mini-instruct": "microsoft/Phi-3.5-mini-instruct",
+    "smollm": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "smollm2": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "smollm2-1.7b": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+    "smollm2-1.7b-instruct": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
     "qwen": "Qwen/Qwen2.5-1.5B-Instruct",
     "qwen2.5": "Qwen/Qwen2.5-1.5B-Instruct",
     "qwen2.5-1.5b": "Qwen/Qwen2.5-1.5B-Instruct",
@@ -238,7 +260,12 @@ class LLMRegistry:
             for p in candidates:
                 if p.exists() and p.is_dir():
                     has_config = (p / "config.json").exists()
-                    has_weights = bool(list(p.glob("*.safetensors")) or list(p.glob("*.bin")))
+                    has_weights = bool(
+                        list(p.glob("*.safetensors"))
+                        or list(p.glob("*.bin"))
+                        or list(p.glob("*.index.json"))
+                        or (list((p / "onnx").glob("*.onnx")) if (p / "onnx").exists() else [])
+                    )
                     if has_config and has_weights:
                         return p.resolve()
             return None

@@ -101,11 +101,9 @@ class ModelRecord:
             list(self.local_path.glob("*.safetensors"))
             + [f for f in self.local_path.glob("pytorch_model*.bin")
                if f.name != "training_args.bin"]
-            + list((self.local_path / "onnx").glob("*.onnx"))
-            if (self.local_path / "onnx").exists()
-            else list(self.local_path.glob("*.safetensors"))
-            + [f for f in self.local_path.glob("pytorch_model*.bin")
-               if f.name != "training_args.bin"]
+            + list(self.local_path.glob("*.index.json"))
+            + (list((self.local_path / "onnx").glob("*.onnx"))
+               if (self.local_path / "onnx").exists() else [])
         )
         self._installed = config_ok and len(weights) > 0
         return self._installed

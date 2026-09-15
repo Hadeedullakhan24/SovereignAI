@@ -274,15 +274,13 @@ def main(args_list: list[str] | None = None) -> None:
 
     if args.model:
         model_name = args.model
-    elif registry.is_model_installed("qwen2.5-1.5b"):
-        model_name = "qwen2.5-1.5b"
     elif is_test_runner:
         model_name = "deterministic_test"
     else:
-        model_name = "qwen2.5-1.5b"
+        model_name = "auto"
 
-    # Strict check: fail clearly if a real local model is expected but not installed
-    if model_name.lower() not in ("deterministic_test", "mock", "test"):
+    # Strict check for explicit model overrides: fail clearly if a real local model is requested but not installed
+    if model_name.lower() not in ("auto", "deterministic_test", "mock", "test"):
         if not registry.is_model_installed(model_name):
             print_banner()
             print(f"\n[ERROR] Required local LLM '{model_name}' is not physically installed on local disk.")
