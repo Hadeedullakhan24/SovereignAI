@@ -36,7 +36,7 @@ Orchestrates the complete inference workflow for Member 1:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import logging
@@ -68,6 +68,7 @@ from rag_engine.retrieval.base_retriever import (
 )
 from rag_engine.retrieval.retrieval_pipeline import RetrievalPipeline
 from rag_engine.grounding.evidence import EvidencePackage, EvidenceSelector, StructuredReport
+from rag_engine.schemas.chunk import Chunk
 
 logger = logging.getLogger(__name__)
 
@@ -528,6 +529,70 @@ class RAGPipeline:
 
         return True
 
+    def _inspect_requested_sources(self, intent: TaskIntent, source_paths: Sequence[str]) -> tuple[list[ScoredRetrievalChunk], list[CitationBundle], list[str]]:
+        """Turn explicitly supplied document/visual sources into gated evidence."""
+        if not intent.requires_source_evidence and not intent.requires_vision_analysis:
+            return [], [], []
+        referenced_paths = list(source_paths) or [name for name in intent.requested_source_names if name.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg", ".dwg"))]
+        if not referenced_paths:
+            return [], [], (["No referenced visual source path was provided."] if intent.requires_vision_analysis else [])
+        from agent.tool_executor import VisionInspectorTool, DEFAULT_PROJECT_ROOT, DEFAULT_SANDBOX_DIR
+        inspector = VisionInspectorTool(DEFAULT_SANDBOX_DIR, DEFAULT_PROJECT_ROOT)
+        candidates: list[ScoredRetrievalChunk] = []
+        citations: list[CitationBundle] = []
+        errors: list[str] = []
+        for path in referenced_paths:
+            try:
+                is_visual = str(path).lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg", ".dwg"))
+                result = inspector.inspect(path, question=intent.raw_query, use_vlm=is_visual)
+                extracted = "\n".join(p for p in [result.get("text", ""), result.get("summary", ""), (result.get("vlm") or {}).get("answer", "")] if p).strip()
+                if result.get("status") == "error" or not extracted:
+                    errors.append(f"No usable visual evidence was extracted from {path}.")
+                    continue
+                name = result.get("filename", str(path).replace("\\", "/").split("/")[-1])
+                chunk = Chunk.create(document_id=f"visual:{name}", content=extracted, chunk_index=0, document_name=name, source_path=result.get("path", str(path)), section_title="Vision and OCR extraction", equipment_entities=list(intent.explicit_entities), image_reference=result.get("path", str(path)))
+                candidate = ScoredRetrievalChunk(chunk=chunk, score=1.0, rank=len(candidates), explainability="explicit requested source processed by VisionInspectorTool")
+                citation = CitationBundle(citation_id=f"[V{len(citations) + 1}]", document_id=chunk.metadata.document_id, document_name=name, source_path=chunk.metadata.source_path, page_number=None, section_title=chunk.metadata.section_title, chunk_id=chunk.chunk_id, verbatim_quote=extracted, score=1.0, equipment_tags=list(intent.explicit_entities), sha256=chunk.metadata.sha256)
+                candidates.append(candidate)
+                citations.append(citation)
+            except Exception as exc:
+                errors.append(f"Unable to analyze referenced visual source {path}: {exc}")
+        return candidates, citations, errors
+
+    @staticmethod
+    def _user_provided_context(intent: TaskIntent) -> tuple[list[ScoredRetrievalChunk], str]:
+        """Create non-citable context for free-form instructions from the user.
+
+        This is deliberately separate from retrieved citations: it authorizes
+        the model to retain the user's own statements, but can never make them
+        appear to be a finding in a PDF, image, or report.
+        """
+        if not intent.raw_query or not intent.user_requirements:
+            return [], ""
+        requirements = intent.user_requirements
+        content = "USER_PROVIDED_INFORMATION:\n" + "\n".join(f"- {item}" for item in requirements)
+        content += "\nSOURCE_GROUNDED_INFORMATION: no document claim is implied by the user-provided information above."
+        chunk = Chunk.create(
+            document_id="__user_provided__", content=content, chunk_index=0,
+            document_name="USER_PROVIDED_INFORMATION", section_title="User requirements",
+        )
+        return [ScoredRetrievalChunk(chunk=chunk, score=1.0, rank=0, explainability="explicit user-provided requirements")], content
+
+    @staticmethod
+    def _preserve_user_email_points(email: str, intent: TaskIntent) -> str:
+        """Preserve non-factual user instructions without mislabeling them as evidence."""
+        if intent.output_format.value != "email" or not intent.explicit_email_instructions:
+            return email
+        result = email
+        missing = [p for p in intent.explicit_email_instructions if p.casefold() not in result.casefold()]
+        if not missing:
+            return result
+        addition = "\n".join(f"Additionally, {point.rstrip('.')}." for point in missing)
+        closing = re.search(r"\n\s*(?:Best regards|Regards|Sincerely),", result, re.IGNORECASE)
+        if closing:
+            return result[:closing.start()].rstrip() + "\n\n" + addition + "\n" + result[closing.start():].lstrip()
+        return result.rstrip() + "\n\n" + addition
+
     def _create_artifact(
         self,
         intent: TaskIntent,
@@ -607,18 +672,42 @@ class RAGPipeline:
         session_id: str = "default_session",
         archetype: PromptArchetype | str = PromptArchetype.GENERAL_QA,
         top_k: int = 5,
+        source_paths: Optional[Sequence[str]] = None,
+        decision: Optional[Any] = None,
     ) -> RAGResponse:
         """Execute end-to-end RAG answer: Retrieval -> Prompting -> Generation -> Validation -> Trace."""
         start_total = time.perf_counter()
+
+        # Resolve authoritative routing decision if not supplied
+        if decision is None:
+            from agent.router import get_router
+            decision = get_router().route(question)
+
+        from agent.router import Capability, RoutingDecision
         intent = TaskClassifier.classify(question)
 
-        # 0. Image Generation Route: bypass document text retrieval unless explicitly requested
-        if intent.operation == TaskOperation.GENERATE_IMAGE or intent.artifact_format == ArtifactFormat.PNG:
+        # 0. Image Generation Route: bypass document text retrieval completely
+        if (
+            decision.capability == Capability.IMAGE_GENERATION
+            or intent.operation == TaskOperation.GENERATE_IMAGE
+            or intent.artifact_format == ArtifactFormat.PNG
+        ):
             from agent.tool_executor import get_tool_executor
             executor = get_tool_executor(rag_pipeline=self)
-            from agent.router import get_router, Capability
-            router = get_router()
-            decision = router.route(question)
+
+            if decision.capability != Capability.IMAGE_GENERATION:
+                from agent.router import get_router
+                router = get_router()
+                model_rec = router.model_registry.ready_for_role("image_generation")
+                decision = RoutingDecision(
+                    capability=Capability.IMAGE_GENERATION,
+                    archetype=PromptArchetype.GENERAL_QA,
+                    model_record=model_rec[0] if model_rec else None,
+                    capability_available=bool(model_rec),
+                    tool_name="image_generator",
+                    use_rag_context=False,
+                    reason=f"Authoritative image generation route for: {question!r}",
+                )
 
             tool_result = executor.execute(decision, task=question)
             total_ms = (time.perf_counter() - start_total) * 1000.0
@@ -645,7 +734,7 @@ class RAGPipeline:
 
             from rag_engine.generation.generation_metrics import GenerationMetrics
             from rag_engine.generation.guardrails.citation_validator import CitationValidationReport
-            from rag_engine.generation.guardrails.confidence_scorer import ConfidenceBreakdown
+            from rag_engine.generation.guardrails.confidence_scorer import ConfidenceScorer
             from rag_engine.generation.guardrails.hallucination_guard import GroundingVerificationReport
 
             gen_resp = GenerationResponse(
@@ -669,7 +758,7 @@ class RAGPipeline:
                     unverified_entities=[],
                     is_grounded=True,
                 ),
-                confidence=self.generation.confidence_scorer.calculate(
+                confidence=ConfidenceScorer().calculate(
                     retrieval_confidence=1.0,
                     citation_precision=1.0,
                     grounding_score=1.0,
@@ -717,7 +806,10 @@ class RAGPipeline:
 
         # 1. Retrieval Phase (Milestone 8)
         retrieval_start = time.perf_counter()
-        retrieval_result = self.retrieval.retrieve(query=question, top_k=top_k)
+        retrieval_result = self.retrieval.retrieve(
+            query=question,
+            top_k=max(top_k, 10) if intent.output_format.value == "email" and intent.requires_source_evidence else top_k,
+        )
         retrieval_total_ms = (time.perf_counter() - retrieval_start) * 1000.0
 
         # Extract retrieval stage metrics if available
@@ -730,20 +822,32 @@ class RAGPipeline:
 
         # 2. Evidence gate. Retrieval rank is not evidence: classify and scope
         # candidates before prompt construction or artifact creation.
-        candidates = getattr(retrieval_result, "candidates", [])
+        candidates = list(getattr(retrieval_result, "candidates", []))
+        retrieval_citations = list(retrieval_result.citations)
+        visual_candidates, visual_citations, visual_errors = self._inspect_requested_sources(intent, source_paths or ())
+        candidates.extend(visual_candidates)
+        retrieval_citations.extend(visual_citations)
         evidence_package = EvidenceSelector().select(
             question,
             candidates,
-            retrieval_result.citations,
+            retrieval_citations,
             is_artifact_request=intent.is_artifact_request,
+            exact_entity_only=(intent.output_format.value == "email" and bool(intent.explicit_entities)),
+            requested_source_names=intent.requested_source_names,
         )
         selected = evidence_package.selected
         report_title = f"{intent.subject_topic.title()} Report" if intent.subject_topic else "Grounded Evidence Report"
         structured_report = evidence_package.report(report_title)
+        user_candidates, user_context = self._user_provided_context(intent)
+        # A format-only request (for example, an email based entirely on the
+        # user's own details) must not acquire unrelated facts from ambient
+        # retrieval. Document evidence remains mandatory when requested.
+        user_only = bool(user_candidates) and not intent.requires_source_evidence and not intent.is_artifact_request
+        generation_items = [] if user_only else selected
         filtered_result = retrieval_result.model_copy(update={
-            "scored_chunks": [item.chunk for item in selected],
-            "citations": list(evidence_package.citations),
-            "packed_context": evidence_package.context(),
+            "scored_chunks": [item.chunk for item in generation_items] + user_candidates,
+            "citations": list(evidence_package.citations) if not user_only else [],
+            "packed_context": "\n\n".join(part for part in [evidence_package.context() if not user_only else "", user_context] if part),
         })
 
         is_report_valid, validation_errors = structured_report.validate()
@@ -756,8 +860,17 @@ class RAGPipeline:
                 or not selected
             )
         )
+        insufficient_for_email_source = (
+            intent.output_format.value == "email"
+            and ((intent.requires_vision_analysis and bool(visual_errors)) or (intent.requires_source_evidence and not selected))
+        )
 
-        if not selected or not self._has_sufficient_evidence(question, [item.chunk for item in selected]) or insufficient_for_artifact:
+        has_user_only_task_context = user_only
+        lacks_usable_evidence = (
+            not has_user_only_task_context
+            and (not selected or not self._has_sufficient_evidence(question, [item.chunk for item in selected]))
+        )
+        if (lacks_usable_evidence or insufficient_for_artifact or insufficient_for_email_source):
             total_ms = (time.perf_counter() - start_total) * 1000.0
             # Construct synthetic GenerationResponse for fallback
             prompt_payload = self.generation.prompt_builder.build_prompt(
@@ -853,6 +966,13 @@ class RAGPipeline:
             session_id=session_id,
             archetype=effective_archetype,
         )
+        # The model receives these directives, but retain them deterministically
+        # as a final invariant. They are user-provided instructions, never
+        # represented as document findings.
+        if intent.output_format.value == "email":
+            preserved = self._preserve_user_email_points(generation_response.answer, intent)
+            if preserved != generation_response.answer:
+                generation_response = replace(generation_response, answer=preserved, raw_answer=preserved)
         generation_ms = (time.perf_counter() - generation_start) * 1000.0
 
         # Physical artifact creation when requested
@@ -920,6 +1040,15 @@ class RAGPipeline:
         top_k: int = 5,
     ) -> tuple[RetrievalResult, Iterator[str]]:
         """Stream RAG response tokens after performing retrieval."""
+        # Requirement preservation and grounding validation are final-answer
+        # invariants.  Use the canonical answer path when free-form user
+        # requirements exist rather than bypassing it with raw token streaming.
+        intent = TaskClassifier.classify(query)
+        if intent.user_requirements:
+            response = self.answer(
+                question=query, session_id=session_id, archetype=archetype, top_k=top_k,
+            )
+            return response.retrieval_result, iter((response.answer,))
         effective_archetype = (
             detect_task_type(query)
             if archetype in (PromptArchetype.GENERAL_QA, "general_qa")

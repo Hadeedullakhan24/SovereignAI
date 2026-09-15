@@ -118,6 +118,27 @@ class DeterministicTestLLM(BaseLocalLLM):
         from rag_engine.retrieval.retrieval_utils import QUERY_STOPWORDS, tokenize_refinery_text
 
         intent = TaskIntentClassifier.classify(question)
+        # User-only generation is authorized by the user's explicit request,
+        # not by a document citation.  Keep this path separate from document
+        # synthesis so it cannot turn user statements into source findings.
+        user_requirements: list[str] = []
+        for _, _, chunk_text in chunks:
+            marker = re.search(r"USER_PROVIDED_INFORMATION:\s*(.*?)(?:\nSOURCE_GROUNDED_INFORMATION:|\Z)", chunk_text, re.DOTALL)
+            if marker:
+                user_requirements.extend(
+                    line.lstrip("- ").strip() for line in marker.group(1).splitlines() if line.strip()
+                )
+        if user_requirements and not intent.requires_source_evidence:
+            if (getattr(intent.output_format, "value", intent.output_format) == "email"
+                    or re.search(r"\bemail\b", prompt, re.IGNORECASE)):
+                points = "\n".join(f"• {item}" for item in user_requirements)
+                return (
+                    "Subject: Request\n\n"
+                    "Dear Team,\n\n"
+                    f"I am writing regarding the following:\n\n{points}\n\n"
+                    "Best regards,\n[Name]"
+                )
+            return "\n".join(user_requirements)
         q_tokens = set(t for t in tokenize_refinery_text(question) if t not in QUERY_STOPWORDS and len(t) > 1)
 
         # Score and rank sentences across all cited chunks

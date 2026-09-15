@@ -153,8 +153,8 @@ _ROUTING_RULES: List[Tuple[Capability, PromptArchetype, List[str]]] = [
         PromptArchetype.GENERAL_QA,
         [
             "image", "photo", "picture", "diagram", "p&id", "pid diagram",
-            "drawing", "scan", "ocr", "handwritten", "sketch", "schematic",
-            "visual", "plate label", "nameplate", "photograph",
+            "drawing", "drawings", "scan", "scanned", "scans", "ocr", "handwritten", "sketch", "schematic",
+            "visual", "plate label", "nameplate", "photograph", "photographs", "weld defects",
         ],
     ),
 
@@ -308,7 +308,20 @@ class TaskRouter:
         """
         normalized = self._normalize(task)
 
-        capability, archetype, matched = self._match_rules(normalized)
+        # 1. Authoritative central intent classification
+        from agent.intent import classify_intent
+        intent_decision = classify_intent(task)
+
+        if intent_decision.is_image_generation:
+            capability = Capability.IMAGE_GENERATION
+            archetype = PromptArchetype.GENERAL_QA
+            matched = intent_decision.matched_cues or ["new_visual_generation_intent"]
+        elif intent_decision.is_existing_visual_analysis:
+            capability = Capability.VISION
+            archetype = PromptArchetype.GENERAL_QA
+            matched = intent_decision.matched_cues or ["existing_visual_analysis_intent"]
+        else:
+            capability, archetype, matched = self._match_rules(normalized)
 
         # Resolve execution tool and RAG context requirement
         tool_name, use_rag_context = self._resolve_tool(capability, task=normalized)
@@ -354,7 +367,7 @@ class TaskRouter:
                     if re.search(pattern, normalized):
                         hits.append(kw)
                 else:
-                    if kw.lower() in normalized:
+                    if re.search(rf"\b{re.escape(kw.lower())}\b", normalized):
                         hits.append(kw)
             if hits:
                 return capability, archetype, hits

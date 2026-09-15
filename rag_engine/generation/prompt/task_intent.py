@@ -102,6 +102,14 @@ class TaskIntent:
     strict_grounding: bool = False
     archetype: PromptArchetype = PromptArchetype.GENERAL_QA
     artifact_format: Optional[ArtifactFormat] = None
+    # Source references are execution constraints, not merely wording hints.
+    requested_source_names: list[str] = field(default_factory=list)
+    requires_source_evidence: bool = False
+    requires_vision_analysis: bool = False
+    explicit_email_instructions: list[str] = field(default_factory=list)
+    # Free-form clauses supplied by the user, independent of any template.
+    user_requirements: list[str] = field(default_factory=list)
+    has_conflicting_requirements: bool = False
     raw_query: str = ""
 
     @property
@@ -116,6 +124,13 @@ class TaskIntent:
     def get_directive_instructions(self) -> str:
         """Generate explicit, enforceable instructions tailored to the classified intent."""
         lines: list[str] = []
+        if self.user_requirements:
+            lines.append("USER_PROVIDED_INFORMATION (not document evidence):")
+            lines.extend(f"- {requirement}" for requirement in self.user_requirements)
+            lines.append("- Preserve every compatible requirement in the requested format. Do not replace it with generic wording or present it as a document finding.")
+            lines.append("- SOURCE_GROUNDED_INFORMATION may support document facts only; keep its provenance distinct from USER_PROVIDED_INFORMATION.")
+        if self.has_conflicting_requirements:
+            lines.append("- CONFLICT DETECTED: ask one concise clarification question instead of silently choosing between incompatible user requirements.")
 
         if self.output_format == OutputFormat.EMAIL:
             lines.append("TASK OBJECTIVE: DRAFT A PROFESSIONAL EMAIL")
@@ -157,6 +172,12 @@ class TaskIntent:
                 lines.append(f"- Subject Line: 'Subject: {subj}'")
 
             lines.append("- Formatting: Do NOT include inline bracket citations [n], references sections, or attachment claims.")
+            if self.requires_source_evidence:
+                lines.append("- SOURCE CONSTRAINT: Retrieve and use the requested source evidence before drafting; do not write a generic email.")
+            if self.requires_vision_analysis:
+                lines.append("- VISUAL SOURCE CONSTRAINT: Use extracted image/P&ID evidence only; do not infer visual details.")
+            for point in self.explicit_email_instructions:
+                lines.append(f"- USER-PROVIDED EMAIL POINT (include unless it contradicts evidence): {point}")
 
         elif self.output_format == OutputFormat.SUMMARY or self.operation == TaskOperation.SUMMARIZE:
             lines.append("TASK OBJECTIVE: GENERATE A CONCISE, STRUCTURED SUMMARY")
@@ -225,7 +246,38 @@ class TaskIntentClassifier:
         re.compile(r"\bstrictly\s+based\s+on\b", re.IGNORECASE),
     ]
 
+    _SOURCE_WORDS = re.compile(
+        r"\b(?:refer\s+to|use|using|attached|provided)\s+(?:the\s+)?(?:inspection\s+)?(?:pdf|report|document)\b|"
+        r"\b(?:p\s*&\s*id|p&id|drawing|image|photo(?:graph)?|scanned\s+document)\b",
+        re.IGNORECASE,
+    )
+    _VISUAL_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg", ".dwg")
+
     _DOC_ACTION_VERBS = r"(?:create|generate|export|prepare|save|output|produce|build|draft|write|download|make)"
+
+    @staticmethod
+    def _extract_user_requirements(query: str) -> tuple[list[str], bool]:
+        """Keep free-form user clauses without imposing a domain field schema."""
+        clauses = [part.strip(" -\t") for part in re.split(r"(?<=[.!?])\s+|\n+", query) if part.strip(" -\t")]
+        # The first clause normally states the format/task. Subsequent clauses
+        # are preserved verbatim as additional requirements, whatever domain
+        # they concern. A one-clause request remains available in raw_query.
+        requirements = clauses[1:] if len(clauses) > 1 else []
+        normalized_positive: set[str] = set()
+        conflicting = False
+        for clause in requirements:
+            normalized = re.sub(r"[^a-z0-9 ]+", " ", clause.casefold())
+            normalized = re.sub(r"\b(?:please|must|should|the|a|an)\b", " ", normalized)
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+            negative = bool(re.search(r"\b(?:do not|don't|never|without)\b", clause, re.IGNORECASE))
+            proposition = re.sub(r"\b(?:do not|don't|never|without)\b", "", normalized).strip()
+            if not proposition:
+                continue
+            if negative and proposition in normalized_positive:
+                conflicting = True
+            if not negative:
+                normalized_positive.add(proposition)
+        return requirements, conflicting
 
     _PDF_GEN_PATTERNS = [
         re.compile(rf"\b{_DOC_ACTION_VERBS}\b.*?\b(?:a|an|the|as|into)?\s*(?:actual\s+)?pdf\b(?:\s+(?:file|document|report|artifact))?", re.IGNORECASE),
@@ -277,6 +329,35 @@ class TaskIntentClassifier:
         raw = query or ""
         q_clean = normalize_whitespace(raw)
         q_lower = q_clean.lower()
+        user_requirements, has_conflicting_requirements = cls._extract_user_requirements(q_clean)
+        source_names: list[str] = []
+        # A filename may contain spaces, but it must follow an explicit source
+        # reference verb (or be a standalone token).  Do not absorb the prose
+        # before it, e.g. "draft an email using inspection.pdf".
+        source_matches = list(re.finditer(
+            r"\b(?:refer\s+to|use|using|attached|provided)\s+(?:the\s+)?[\"']?([^\"']+?\.(?:pdf|png|jpe?g|tiff?|bmp|gif|svg|dwg|docx?|xlsx?|pptx?))\b",
+            q_clean,
+            re.IGNORECASE,
+        ))
+        if not source_matches:
+            source_matches = list(re.finditer(
+                r"(?<![\w.])([\w.-]+\.(?:pdf|png|jpe?g|tiff?|bmp|gif|svg|dwg|docx?|xlsx?|pptx?))\b",
+                q_clean,
+                re.IGNORECASE,
+            ))
+        for match in source_matches:
+            name = match.group(1).strip()
+            if name and name not in source_names:
+                source_names.append(name)
+        requires_source_evidence = bool(source_names or cls._SOURCE_WORDS.search(q_clean))
+        requires_vision_analysis = any(name.lower().endswith(cls._VISUAL_EXTENSIONS) for name in source_names) or bool(
+            re.search(r"\b(?:p\s*&\s*id|p&id|drawing|image|photo(?:graph)?|scanned\s+document)\b", q_clean, re.IGNORECASE)
+        )
+        explicit_email_instructions = []
+        for match in re.finditer(r"\b(?:add|include|mention)\s+(?:the\s+)?(?:specific\s+)?(?:point\s+)?(?:i\s+mentioned\s+)?(?:about\s+)?(.+?)(?:\.|$)", q_clean, re.IGNORECASE):
+            point = match.group(1).strip(" ,;:")
+            if point and point.lower() not in {"the report", "the pdf", "the document"}:
+                explicit_email_instructions.append(point)
 
         # 1. Strict Grounding Mode Detection
         strict_grounding = any(pat.search(q_clean) for pat in cls._STRICT_GROUNDING_PATTERNS)
@@ -298,7 +379,11 @@ class TaskIntentClassifier:
 
         # 3. Detect Explicit Document / Image Artifact Generation Request
         detected_artifact: Optional[ArtifactFormat] = None
-        if any(pat.search(q_clean) for pat in cls._IMAGE_GEN_PATTERNS):
+        from agent.intent import classify_intent
+        central_intent = classify_intent(q_clean)
+        if central_intent.is_image_generation:
+            detected_artifact = ArtifactFormat.PNG
+        elif any(pat.search(q_clean) for pat in cls._IMAGE_GEN_PATTERNS):
             detected_artifact = ArtifactFormat.PNG
         elif any(pat.search(q_clean) for pat in cls._PDF_GEN_PATTERNS):
             detected_artifact = ArtifactFormat.PDF
@@ -313,7 +398,7 @@ class TaskIntentClassifier:
         is_email = any(k in q_lower for k in [
             "draft an email", "draft email", "write an email", "write email",
             "compose an email", "compose email", "send an email", "send email", "prepare an email",
-        ])
+        ]) or bool(re.search(r"\b(?:draft|write|compose|send|prepare)\s+(?:an?\s+)?(?:[\w-]+\s+){0,3}email\b", q_clean, re.IGNORECASE))
 
         is_approval_note = any(k in q_lower for k in [
             "draft an approval note", "draft approval note", "prepare an approval note",
@@ -352,7 +437,9 @@ class TaskIntentClassifier:
         subject_topic = cls._extract_topic(q_clean)
 
         # 6. Branch for Explicit Artifact Generation vs Text Tasks
-        if detected_artifact is not None:
+        # A referenced PDF/image is input evidence, not an instruction to
+        # create an artifact.  Email intent has precedence over artifact words.
+        if detected_artifact is not None and not is_email:
             if detected_artifact == ArtifactFormat.PNG:
                 output_format = OutputFormat.IMAGE
                 operation = TaskOperation.GENERATE_IMAGE
@@ -392,6 +479,12 @@ class TaskIntentClassifier:
                 strict_grounding=strict_grounding,
                 archetype=archetype,
                 artifact_format=detected_artifact,
+                requested_source_names=source_names,
+                requires_source_evidence=requires_source_evidence,
+                requires_vision_analysis=requires_vision_analysis,
+                explicit_email_instructions=explicit_email_instructions,
+                user_requirements=user_requirements,
+                has_conflicting_requirements=has_conflicting_requirements,
                 raw_query=raw,
             )
 
@@ -513,6 +606,12 @@ class TaskIntentClassifier:
             is_general_query=is_general_query,
             strict_grounding=strict_grounding,
             archetype=archetype,
+            requested_source_names=source_names,
+            requires_source_evidence=requires_source_evidence,
+            requires_vision_analysis=requires_vision_analysis,
+            explicit_email_instructions=explicit_email_instructions,
+            user_requirements=user_requirements,
+            has_conflicting_requirements=has_conflicting_requirements,
             raw_query=raw,
         )
 

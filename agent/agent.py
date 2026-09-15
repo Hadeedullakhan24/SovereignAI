@@ -369,6 +369,15 @@ class SovereignAgent:
             or _extract_image_path(user_request)
         )
         if vision_file_path:
+            # An email that names an image/P&ID must not terminate at the
+            # inspection fast-path: send the extracted source through the
+            # canonical RAG/evidence/email path instead.
+            from rag_engine.generation.prompt.task_intent import OutputFormat, TaskClassifier
+            email_intent = TaskClassifier.classify(user_request)
+            if email_intent.output_format == OutputFormat.EMAIL:
+                return self._handle_grounded_email(
+                    user_request, vision_file_path, t0, registry_snap, **kwargs
+                )
             return self._handle_vision(user_request, vision_file_path, t0, registry_snap, **kwargs)
 
         # ── Standard 7-step planner path ────────────────────────────────────
@@ -400,6 +409,34 @@ class SovereignAgent:
             response.checkpoint_id,
         )
         return response
+
+    def _handle_grounded_email(
+        self,
+        user_request: str,
+        source_path: str,
+        t0: float,
+        registry_snap: Dict[str, Any],
+        **kwargs: Any,
+    ) -> AgentResponse:
+        """Run an email with an attached visual source through canonical RAG."""
+        try:
+            result = self.tool_executor.rag_search(
+                query=user_request,
+                top_k=kwargs.pop("top_k", 10),
+                source_paths=[source_path],
+            )
+        except Exception as exc:
+            return AgentResponse(status="failed", error=str(exc), total_time_ms=(time.perf_counter() - t0) * 1000.0, model_registry_status=registry_snap)
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        verified = result.get("status") == "success"
+        return AgentResponse(
+            status="completed" if verified else "requires_verification",
+            is_verified=verified,
+            output={"email": result.get("answer", ""), "sources": result.get("citations", [])},
+            execution_trace="Email -> source extraction -> RAG evidence gate -> grounded email",
+            reasoning_steps=[{"step_number": 1, "name": "Grounded email drafting", "step_type": "automated", "action": "rag_search with supplied source", "status": result.get("status"), "is_verified": verified}],
+            error=result.get("error"), total_time_ms=elapsed, model_registry_status=registry_snap,
+        )
 
     def _handle_vision(
         self,

@@ -27,9 +27,12 @@ def _runtime_root() -> Path:
 
 
 def default_vector_storage_path() -> Path:
-    local_p = Path("vector_db/qdrant")
-    if local_p.exists() and local_p.is_dir():
-        return local_p
+    """Return the location for mutable embedded Qdrant state.
+
+    A source checkout can contain a seeded ``vector_db/qdrant`` directory, but
+    it must never become the implicit runtime database: that both mutates
+    repository data and makes test/process state leak across runs.
+    """
     return _runtime_root() / "vector_db" / "qdrant"
 
 
@@ -123,3 +126,19 @@ class VectorStoreConfig(BaseModel):
     journal_path: Path = Field(default_factory=default_journal_path, description="Directory for transaction WAL records")
     backup_path: Path = Field(default_factory=default_backup_path, description="Directory for tar.gz snapshots")
     telemetry_path: Path = Field(default_factory=default_telemetry_path, description="Directory for storage stats")
+
+    def model_post_init(self, __context: Any) -> None:
+        """Co-locate implicit operational state with an explicit store path.
+
+        Callers that set only ``storage_path`` expect a self-contained local
+        store.  Leaving the WAL at a process-relative default instead can
+        write into a checkout and makes otherwise isolated stores interfere.
+        Explicit journal/backup/telemetry settings are retained unchanged.
+        """
+        root = self.storage_path.parent
+        if "journal_path" not in self.model_fields_set:
+            self.journal_path = root / "journal"
+        if "backup_path" not in self.model_fields_set:
+            self.backup_path = root / "backups"
+        if "telemetry_path" not in self.model_fields_set:
+            self.telemetry_path = root / "telemetry"
