@@ -174,7 +174,11 @@ class GenerationPipeline:
             model_name=self.model.model_name,
         )
 
-        if self.cache is not None and self.config.cache_enabled:
+        # User-only requests carry live, non-citable requirements.  Do not
+        # reuse a prior document-oriented fallback for them; their validation
+        # context is intentionally different from retrieved evidence.
+        user_provided_context = "USER_PROVIDED_INFORMATION" in prompt_payload.context_window
+        if self.cache is not None and self.config.cache_enabled and not user_provided_context:
             cached = self.cache.get(cache_key)
             if cached is not None:
                 # A cache entry is not evidence.  Revalidate it against the
@@ -327,7 +331,7 @@ class GenerationPipeline:
             metadata={"confidence": confidence.composite_score},
         )
 
-        if self.cache is not None and self.config.cache_enabled:
+        if self.cache is not None and self.config.cache_enabled and not user_provided_context:
             self.cache.put(
                 cache_key=cache_key,
                 prompt_hash=prompt_payload.prompt_hash,

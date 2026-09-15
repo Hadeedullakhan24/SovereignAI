@@ -2069,6 +2069,7 @@ class ToolExecutor:
         archetype: PromptArchetype = PromptArchetype.GENERAL_QA,
         session_id: str = "agent_session",
         model_name: Optional[str] = None,
+        source_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Execute a REAL search via Member 1's RAGPipeline.
 
@@ -2085,6 +2086,7 @@ class ToolExecutor:
                 session_id=session_id,
                 archetype=archetype,
                 top_k=top_k,
+                source_paths=source_paths,
             )
 
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -2317,6 +2319,12 @@ class ToolExecutor:
             fallback_warning = kwargs.get("fallback_warning", None)
             routed_model_name = kwargs.get("model_name")
 
+        # Strict guardrail: Image generation requests NEVER retrieve document context via RAG
+        if tool_name in ("image_generator", "image_generation", "generate_image") or (
+            isinstance(decision_or_tool, RoutingDecision) and decision_or_tool.capability == Capability.IMAGE_GENERATION
+        ):
+            use_rag_context = False
+
         # ── Step 1: Optional RAG Context Retrieval ─────────────────────
         rag_context: Optional[Dict[str, Any]] = None
         if use_rag_context:
@@ -2329,6 +2337,7 @@ class ToolExecutor:
                     archetype=archetype,
                     session_id=kwargs.get("session_id", "agent_session"),
                     model_name=routed_model_name,
+                    source_paths=kwargs.get("source_paths"),
                 )
 
         # Artifact tools consume the canonical report produced by the evidence
