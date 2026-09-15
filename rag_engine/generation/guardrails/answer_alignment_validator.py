@@ -64,14 +64,14 @@ class AnswerAlignmentValidator:
         ]
 
     def sanitize_meta_commentary(self, text: str) -> tuple[str, list[str]]:
-        """Strip LLM conversational meta-commentary artifacts."""
+        """Strip LLM conversational meta-commentary artifacts while preserving document structure."""
         cleaned = text
         removed: list[str] = []
         for pat in self._meta_patterns:
             if pat.search(cleaned):
                 cleaned = pat.sub("", cleaned)
                 removed.append("Meta-commentary preamble")
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"[^\S\r\n]+", " ", cleaned).strip()
         return cleaned, removed
 
     def sanitize_contradictions(self, text: str) -> tuple[str, list[str]]:
@@ -96,7 +96,7 @@ class AnswerAlignmentValidator:
         return cleaned.strip(), fixed
 
     def sanitize_speculation(self, query: str, text: str) -> tuple[str, list[str]]:
-        """Remove speculative inferences that fill missing evidence with guesses."""
+        """Remove speculative inferences that fill missing evidence with guesses while preserving formatting."""
         removed: list[str] = []
         cleaned = text
 
@@ -107,8 +107,8 @@ class AnswerAlignmentValidator:
                     removed.append(m.strip())
                 cleaned = pat.sub("", cleaned).strip()
 
-        # Clean double spaces or orphaned punctuation
-        cleaned = re.sub(r"\s+", " ", cleaned).replace(" .", ".").replace(" ,", ",").strip()
+        # Clean double spaces or orphaned punctuation while preserving newlines
+        cleaned = re.sub(r"[^\S\r\n]+", " ", cleaned).replace(" .", ".").replace(" ,", ",").strip()
         return cleaned, removed
 
     def sanitize_circular_definitions(self, query: str, text: str) -> tuple[str, list[str]]:
@@ -123,6 +123,58 @@ class AnswerAlignmentValidator:
 
         return cleaned, fixed
 
+    def sanitize_intent_and_entities(self, query: str, text: str) -> tuple[str, list[str]]:
+        """Sanitize email subject, salutation, tone, and scope to preserve user intent."""
+        from rag_engine.generation.prompt.task_intent import EmailPurpose, OutputFormat, TaskIntentClassifier
+        intent = TaskIntentClassifier.classify(query)
+        cleaned = text
+        changes: list[str] = []
+
+        if intent.output_format == OutputFormat.EMAIL:
+            # 1. Fix Recipient Salutation if specified by user
+            if intent.recipient:
+                target_salutation = f"Dear {intent.recipient},"
+                salutation_pat = re.compile(r"^Dear\s+[^,\n]+,", re.MULTILINE | re.IGNORECASE)
+                m = salutation_pat.search(cleaned)
+                if m and m.group(0).strip().lower() != target_salutation.lower():
+                    cleaned = salutation_pat.sub(target_salutation, cleaned, count=1)
+                    changes.append(f"Corrected salutation to preserve requested recipient '{intent.recipient}'")
+
+            # 2. Fix Email Subject Line according to intent
+            subj_pat = re.compile(r"^Subject:\s*([^\n]+)", re.MULTILINE | re.IGNORECASE)
+            subj_match = subj_pat.search(cleaned)
+            if subj_match:
+                current_subj = subj_match.group(1).strip()
+                if intent.email_purpose == EmailPurpose.SUMMARY:
+                    if any(bad in current_subj.lower() for bad in ["request for confirmation", "request for approval", "approval request", "action required"]):
+                        new_subj = f"Subject: {intent.subject_topic} — Summary" if intent.subject_topic else "Subject: Summary of Requirements"
+                        cleaned = subj_pat.sub(new_subj, cleaned, count=1)
+                        changes.append("Corrected email subject line to reflect summary intent")
+                    elif intent.is_general_query and re.search(r"\bfor\s+[A-Z]+-\d+\b", current_subj, re.IGNORECASE):
+                        clean_subj_topic = re.sub(r"\s+for\s+[A-Z]+-\d+", "", current_subj, flags=re.IGNORECASE)
+                        cleaned = subj_pat.sub(f"Subject: {clean_subj_topic}", cleaned, count=1)
+                        changes.append("Removed unrequested equipment identifier from email subject")
+
+            # 3. For SUMMARY emails, sanitize ungrounded action/confirmation demands in the opening
+            if intent.email_purpose == EmailPurpose.SUMMARY:
+                demand_pat = re.compile(
+                    r"I\s+am\s+writing\s+to\s+request\s+your\s+immediate\s+attention\s+to[^.\n]*\.\s*(?:As\s+per\s+our\s+recent\s+team\s+review[^.\n]*\.\s*)?",
+                    re.IGNORECASE,
+                )
+                if demand_pat.search(cleaned):
+                    cleaned = demand_pat.sub("Please find below a summary of the documented safety requirements:\n\n", cleaned)
+                    changes.append("Sanitized demand language to preserve summary email intent")
+
+                confirm_pat = re.compile(
+                    r"(?:Specifically,\s*)?we\s+require\s+confirmation\s+of\s+([^\n.]+)\.",
+                    re.IGNORECASE,
+                )
+                if confirm_pat.search(cleaned):
+                    cleaned = confirm_pat.sub(r"Key requirements include: \1.", cleaned)
+                    changes.append("Sanitized unrequested confirmation requirement")
+
+        return cleaned, changes
+
     def evaluate(
         self,
         query: str,
@@ -132,11 +184,12 @@ class AnswerAlignmentValidator:
         is_citation_valid: bool = True,
     ) -> AlignmentEvaluationReport:
         """Perform comprehensive evaluation and discipline sanitization."""
-        # 1. Sanitize meta-commentary, contradictions, speculation & circular definitions
+        # 1. Sanitize meta-commentary, contradictions, speculation, circular definitions & intent/entity hijacking
         clean_text, meta_removed = self.sanitize_meta_commentary(answer_text)
         clean_text, contra_fixed = self.sanitize_contradictions(clean_text)
         clean_text, spec_removed = self.sanitize_speculation(query, clean_text)
         clean_text, circ_fixed = self.sanitize_circular_definitions(query, clean_text)
+        clean_text, intent_fixed = self.sanitize_intent_and_entities(query, clean_text)
 
         # 2. Check Question Alignment: Does the answer address the core entity/property in query?
         ans_lower = clean_text.lower()

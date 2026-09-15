@@ -87,50 +87,66 @@ def run_interactive_repl(
                     "total_latency_ms": response.total_latency_ms,
                     "model_used": response.model_used,
                     "citations": [c.model_dump() for c in response.citations],
+                    "artifact": response.artifact.to_dict() if response.artifact else None,
                     "execution_trace": response.execution_trace.to_dict() if response.execution_trace else None,
                 }
                 print(json.dumps(output_dict, indent=2))
             elif stream:
-                print("\nAssistant")
-                retrieval_res, token_stream = pipeline.stream_query(
-                    query=query,
-                    session_id=session_id,
-                    archetype=archetype,
-                    top_k=top_k,
-                )
-                tokens: list[str] = []
-                for tok in token_stream:
-                    print(tok, end="", flush=True)
-                    tokens.append(tok)
-                full_answer = "".join(tokens)
-                print()
+                from rag_engine.generation.prompt.task_intent import TaskClassifier
+                intent = TaskClassifier.classify(query)
+                if intent.is_artifact_request:
+                    print("\nAssistant")
+                    response = pipeline.answer(
+                        question=query,
+                        session_id=session_id,
+                        archetype=archetype,
+                        top_k=top_k,
+                    )
+                    if debug:
+                        print(response.format_cli_output(detailed=True))
+                    else:
+                        print(response.format_clean_cli_output())
+                else:
+                    print("\nAssistant")
+                    retrieval_res, token_stream = pipeline.stream_query(
+                        query=query,
+                        session_id=session_id,
+                        archetype=archetype,
+                        top_k=top_k,
+                    )
+                    tokens: list[str] = []
+                    for tok in token_stream:
+                        print(tok, end="", flush=True)
+                        tokens.append(tok)
+                    full_answer = "".join(tokens)
+                    print()
 
-                # Record multi-turn conversation turn
-                chunk_ids = (
-                    [c.chunk.chunk_id for c in retrieval_res.candidates]
-                    if getattr(retrieval_res, "candidates", None)
-                    else []
-                )
-                citations = [
-                    getattr(c, "citation_id", f"[{i+1}]")
-                    for i, c in enumerate(retrieval_res.citations)
-                ]
-                pipeline.generation.memory.add_turn(
-                    session_id=session_id,
-                    user_query=query,
-                    response=full_answer,
-                    retrieved_chunk_ids=chunk_ids,
-                    citations=citations,
-                )
+                    # Record multi-turn conversation turn
+                    chunk_ids = (
+                        [c.chunk.chunk_id for c in retrieval_res.candidates]
+                        if getattr(retrieval_res, "candidates", None)
+                        else []
+                    )
+                    citations = [
+                        getattr(c, "citation_id", f"[{i+1}]")
+                        for i, c in enumerate(retrieval_res.citations)
+                    ]
+                    pipeline.generation.memory.add_turn(
+                        session_id=session_id,
+                        user_query=query,
+                        response=full_answer,
+                        retrieved_chunk_ids=chunk_ids,
+                        citations=citations,
+                    )
 
-                clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
-                concise_sources = ResponseFormatter.format_concise_sources(
-                    retrieval_res.citations,
-                    query=query,
-                    answer=clean_ans,
-                )
-                if concise_sources:
-                    print(f"\n{concise_sources}")
+                    clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
+                    concise_sources = ResponseFormatter.format_concise_sources(
+                        retrieval_res.citations,
+                        query=query,
+                        answer=clean_ans,
+                    )
+                    if concise_sources:
+                        print(f"\n{concise_sources}")
             else:
                 print("\nAssistant")
                 response = pipeline.answer(
@@ -301,6 +317,7 @@ def main(args_list: list[str] | None = None) -> None:
                 "total_latency_ms": response.total_latency_ms,
                 "model_used": response.model_used,
                 "citations": [c.model_dump() for c in response.citations],
+                "artifact": response.artifact.to_dict() if response.artifact else None,
                 "execution_trace": response.execution_trace.to_dict() if response.execution_trace else None,
             }
             print(json.dumps(output_dict, indent=2))
@@ -314,30 +331,44 @@ def main(args_list: list[str] | None = None) -> None:
             )
             print(response.format_cli_output(detailed=True))
         elif args.stream:
-            print_banner()
-            print(f"\nYou\n> {query}")
-            print("\nAssistant")
-            retrieval_res, token_stream = pipeline.stream_query(
-                query=query,
-                session_id=args.session_id,
-                archetype=archetype,
-                top_k=args.top_k,
-            )
-            tokens: list[str] = []
-            for tok in token_stream:
-                print(tok, end="", flush=True)
-                tokens.append(tok)
-            full_answer = "".join(tokens)
-            print()
+            from rag_engine.generation.prompt.task_intent import TaskClassifier
+            intent = TaskClassifier.classify(query)
+            if intent.is_artifact_request:
+                print_banner()
+                print(f"\nYou\n> {query}")
+                print("\nAssistant")
+                response = pipeline.answer(
+                    question=query,
+                    session_id=args.session_id,
+                    archetype=archetype,
+                    top_k=args.top_k,
+                )
+                print(response.format_clean_cli_output())
+            else:
+                print_banner()
+                print(f"\nYou\n> {query}")
+                print("\nAssistant")
+                retrieval_res, token_stream = pipeline.stream_query(
+                    query=query,
+                    session_id=args.session_id,
+                    archetype=archetype,
+                    top_k=args.top_k,
+                )
+                tokens: list[str] = []
+                for tok in token_stream:
+                    print(tok, end="", flush=True)
+                    tokens.append(tok)
+                full_answer = "".join(tokens)
+                print()
 
-            clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
-            concise_sources = ResponseFormatter.format_concise_sources(
-                retrieval_res.citations,
-                query=query,
-                answer=clean_ans,
-            )
-            if concise_sources:
-                print(f"\n{concise_sources}")
+                clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
+                concise_sources = ResponseFormatter.format_concise_sources(
+                    retrieval_res.citations,
+                    query=query,
+                    answer=clean_ans,
+                )
+                if concise_sources:
+                    print(f"\n{concise_sources}")
         else:
             print_banner()
             print(f"\nYou\n> {query}")

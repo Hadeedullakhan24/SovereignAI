@@ -60,7 +60,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from agent.model_registry import AgentModelRegistry, get_agent_registry
-from agent.router import TaskRouter
+from agent.router import Capability, RoutingDecision, TaskRouter
 from agent.tool_executor import DEFAULT_SANDBOX_DIR, ToolExecutor
 from agent.planner import (
     AgentPlanner,
@@ -155,7 +155,7 @@ _IMAGE_EXTENSIONS: frozenset = frozenset({
 # is captured as a whole.
 _IMAGE_PATH_RE = re.compile(
     r"(?:^|\s|['\"])"   # start of string, whitespace, or quote
-    r"([\w./\\-]+"      # path characters (no spaces)
+    r"([\w.:/\\-]+"     # path characters (no spaces, includes Windows drive letter colon)
     r"(?:" + "|".join(re.escape(e) for e in sorted(_IMAGE_EXTENSIONS)) + r"))"
     r"(?:$|\s|['\"])",  # end of string, whitespace, or quote
     re.IGNORECASE,
@@ -350,7 +350,15 @@ class SovereignAgent:
         """
         t0 = time.perf_counter()
         registry_snap = self._registry_snapshot()
-        logger.info("SovereignAgent.handle | request=%r", user_request[:120])
+        # ── Router Dispatch ─────────────────────────────────────────────────
+        # Determine capability, archetype, and designated execution tool.
+        decision: RoutingDecision = self.router.route(user_request)
+
+        # ── Image Generation Direct Route ───────────────────────────────────
+        # Route generative text-to-image synthesis requests directly to
+        # ToolExecutor.execute("image_generator", ...) bypassing the document planner.
+        if decision.capability == Capability.IMAGE_GENERATION or decision.tool_name == "image_generator":
+            return self._handle_image_generation(user_request, decision, t0, registry_snap, **kwargs)
 
         # ── Vision Fast-Path ────────────────────────────────────────────────
         # Detect image/PDF paths in the request and short-circuit to the
@@ -491,6 +499,102 @@ class SovereignAgent:
             "SovereignAgent._handle_vision done | status=%s | chars=%d | time=%.1fms",
             agent_status,
             len(raw_out.get("text", "")),
+            elapsed,
+        )
+        return response
+
+    def _handle_image_generation(
+        self,
+        user_request: str,
+        decision: RoutingDecision,
+        t0: float,
+        registry_snap: Dict[str, Any],
+        **kwargs: Any,
+    ) -> AgentResponse:
+        """Direct image-generation path: invoke ImageGeneratorTool and return results.
+
+        Bypasses the 7-step ReAct planner. Extracts generation parameters
+        from natural language task or kwargs, runs local Stable Diffusion via
+        ToolExecutor, and formats the response.
+        """
+        logger.info(
+            "SovereignAgent._handle_image_generation | request=%r",
+            user_request[:100],
+        )
+        from agent.router import extract_image_generation_params
+
+        # Extract generation parameters
+        params = extract_image_generation_params(user_request, **kwargs)
+
+        try:
+            tool_result = self.tool_executor.execute(
+                decision,
+                task=user_request,
+                **params,
+            )
+        except Exception as exc:
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            logger.error("SovereignAgent._handle_image_generation error: %s", exc, exc_info=True)
+            return AgentResponse(
+                status="failed",
+                error=str(exc),
+                total_time_ms=elapsed,
+                model_registry_status=registry_snap,
+            )
+
+        elapsed = (time.perf_counter() - t0) * 1000.0
+
+        if tool_result.status == "success":
+            agent_status = "completed"
+        elif tool_result.status == "capability_unavailable":
+            agent_status = "failed"
+        else:
+            agent_status = "failed"
+
+        output_payload: Dict[str, Any] = tool_result.output or {}
+        if tool_result.metadata:
+            output_payload.setdefault("metadata", tool_result.metadata)
+
+        prompt_used = params.get("prompt") or user_request
+        trace_summary = (
+            f"Image generation: image_generator({prompt_used!r}) "
+            f"-> {tool_result.status} "
+            f"[{output_payload.get('filename', 'artifact')}]"
+        )
+
+        reasoning_step = {
+            "step_number": 1,
+            "name": "Local Stable Diffusion Image Synthesis",
+            "step_type": "automated",
+            "action": f"image_generator(prompt={prompt_used!r})",
+            "observation": (
+                f"Generated {output_payload.get('filename')} "
+                f"({output_payload.get('width')}x{output_payload.get('height')}) in "
+                f"{output_payload.get('generation_time_seconds', 0):.2f}s | "
+                f"Peak VRAM: {output_payload.get('peak_vram_mb', 0):.1f} MB"
+                if tool_result.status == "success"
+                else f"Generation failed: {tool_result.error}"
+            ),
+            "status": tool_result.status,
+            "is_verified": tool_result.is_verified,
+            "execution_time_ms": round(elapsed, 2),
+        }
+
+        response = AgentResponse(
+            status=agent_status,
+            requires_approval=False,
+            is_verified=tool_result.is_verified,
+            output=output_payload,
+            execution_trace=trace_summary,
+            reasoning_steps=[reasoning_step],
+            error=tool_result.error,
+            total_time_ms=elapsed,
+            model_registry_status=registry_snap,
+        )
+        logger.info(
+            "SovereignAgent._handle_image_generation done | status=%s | file=%s | time=%.1fms",
+            agent_status,
+            output_payload.get("filename"),
             elapsed,
         )
         return response

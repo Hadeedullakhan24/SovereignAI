@@ -12,7 +12,9 @@ Provides deterministic and safe tool execution for the agent workbench:
   6. xlsx_generator     : Excel workbook generator using openpyxl.
   7. pptx_generator     : PowerPoint presentation generator using python-pptx.
   8. pdf_generator      : PDF converter on top of .docx output (docx2pdf / libreoffice --headless).
-  9. audit_logger       : Append-only JSONL log of every tool execution for governance.
+  9. vision_inspector   : Multimodal OCR & VLM visual inspection tool (PaddleOCR / Qwen2.5-VL).
+  10. image_generator   : Offline local Stable Diffusion text-to-image generator.
+  11. audit_logger      : Append-only JSONL log of every tool execution for governance.
 
 All tool branches catch their own exceptions and return a structured ToolResult(error=...);
 no unhandled exception propagates to the caller (no silent 500s).
@@ -36,6 +38,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
@@ -46,7 +49,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from agent.router import Capability, RoutingDecision
-from agent.local_vision import LocalVisionUnavailable, QwenVisionRuntime
 from rag_engine.generation.generation_config import GenerationConfig
 from rag_engine.generation.prompt.prompt_templates import PromptArchetype
 from rag_engine.pipeline.rag_pipeline import (
@@ -67,8 +69,146 @@ DOCUMENT_TOOL_CONTRACTS: Dict[str, Dict[str, Any]] = {
     "document_generator": {"format": "docx", "implemented": True, "input": ["title", "sections", "filename", "metadata"], "output": ["path", "file_size_bytes"]},
     "xlsx_generator": {"format": "xlsx", "implemented": True, "input": ["workbook", "filename"], "output": ["path", "metadata"]},
     "pptx_generator": {"format": "pptx", "implemented": True, "input": ["slides", "filename"], "output": ["path", "metadata"]},
-    "pdf_generator": {"format": "pdf", "implemented": True, "input": ["docx_filename", "out_filename"], "output": ["path", "metadata"]},
+    "pdf_generator": {"format": "pdf", "implemented": True, "input": ["title", "sections", "filename", "metadata", "docx_filename", "out_filename"], "output": ["path", "metadata", "file_size_bytes"]},
+    "image_generator": {
+        "format": "png",
+        "implemented": True,
+        "input": [
+            "prompt",
+            "negative_prompt",
+            "width",
+            "height",
+            "steps",
+            "guidance_scale",
+            "seed",
+            "filename",
+            "filename_prefix",
+        ],
+        "output": [
+            "path",
+            "filename",
+            "file_size_bytes",
+            "staged_path",
+            "dimensions",
+            "generation_time_seconds",
+            "peak_vram_mb",
+            "seed",
+            "model_name",
+        ],
+    },
 }
+
+def validate_artifact(path: Union[str, Path], expected_format: str, required_sources: Optional[List[Any]] = None) -> Dict[str, Any]:
+    """Validate bytes *and* readability; existence alone is never success."""
+    target = Path(path)
+    if not target.is_file() or target.stat().st_size == 0:
+        raise RuntimeError("artifact was not written")
+    fmt = expected_format.casefold().lstrip(".")
+    raw = target.read_bytes()[:8]
+    expected_names = [str(getattr(c, "document_name", "") or getattr(c, "document_id", "")) for c in (required_sources or [])]
+    extracted_text = ""
+    if fmt == "pdf":
+        if not raw.startswith(b"%PDF-"):
+            raise RuntimeError("generated file does not have a PDF signature")
+        try:
+            import fitz
+            doc_fitz = fitz.open(str(target))
+            if len(doc_fitz) == 0:
+                raise RuntimeError("generated PDF has no readable pages")
+            extracted_text = "\n".join(page.get_text() for page in doc_fitz)
+            doc_fitz.close()
+        except ImportError:
+            try:
+                import importlib
+                pypdf_mod = importlib.import_module("pypdf")
+                reader = pypdf_mod.PdfReader(str(target))
+                if not reader.pages:
+                    raise RuntimeError("generated PDF has no readable pages")
+                extracted_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            except Exception:
+                extracted_text = raw.decode("latin-1", errors="ignore")
+    elif fmt in {"docx", "xlsx", "pptx"}:
+        if not raw.startswith(b"PK") or not zipfile.is_zipfile(target):
+            raise RuntimeError(f"generated file does not have a valid {fmt.upper()} package signature")
+        with zipfile.ZipFile(target) as package:
+            required = {"docx": "word/document.xml", "xlsx": "xl/workbook.xml", "pptx": "ppt/presentation.xml"}[fmt]
+            if required not in package.namelist():
+                raise RuntimeError(f"generated {fmt.upper()} package is missing its main document part")
+        if fmt == "docx":
+            import docx
+            doc = docx.Document(str(target))
+            extracted_text = "\n".join(
+                [p.text for p in doc.paragraphs]
+                + [c.text for tbl in doc.tables for r in tbl.rows for c in r.cells]
+            )
+        elif fmt == "xlsx":
+            import openpyxl
+            wb = openpyxl.load_workbook(str(target), read_only=True)
+            extracted_text = "\n".join(
+                str(cell) for ws in wb.worksheets for row in ws.iter_rows(values_only=True) for cell in row if cell is not None
+            )
+            wb.close()
+        else:
+            from pptx import Presentation
+            prs = Presentation(str(target))
+            extracted_text = "\n".join(
+                shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text") and shape.text
+            )
+    else:
+        raise ValueError(f"unsupported artifact format: {expected_format}")
+
+    # Enforce placeholder rejection
+    import re
+    placeholder_matches = re.findall(
+        r"\b(20XX(?:-\d{2}-\d{2})?|2XXX(?:-\d{2}-\d{2})?|19XX|YYYY|UNKNOWN_TAG|PLACEHOLDER|INSERT_DATE|\[(?:DATE|LOCATION|EQUIPMENT|TAG)\])\b",
+        extracted_text,
+        re.IGNORECASE,
+    )
+    if placeholder_matches:
+        raise RuntimeError(f"Artifact contains prohibited placeholder values: {', '.join(set(placeholder_matches))}")
+
+    missing_sources = [name for name in expected_names if name and name not in extracted_text]
+    if missing_sources:
+        raise RuntimeError(f"artifact is missing required source references: {', '.join(missing_sources)}")
+    return {"validated": True, "format": fmt, "size": target.stat().st_size}
+
+
+def stage_artifact_for_backend(sandbox_path: Union[str, Path]) -> Optional[Path]:
+    """Safely stage a verified sandbox artifact for backend HTTP serving.
+
+    Copies the validated file from sandbox to the backend artifacts directory
+    while strictly preventing path traversal and leaks.
+    """
+    try:
+        path_obj = Path(sandbox_path).resolve()
+        if not path_obj.is_file():
+            return None
+
+        filename = path_obj.name
+        if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+            return None
+
+        import shutil
+        # Stage to project backend artifacts directory
+        proj_backend_dir = DEFAULT_PROJECT_ROOT / "backend" / "artifacts"
+        proj_backend_dir.mkdir(parents=True, exist_ok=True)
+        target_file = proj_backend_dir / filename
+        shutil.copy2(path_obj, target_file)
+
+        # Also stage to runtime location if distinct
+        try:
+            from rag_engine.config.runtime_paths import runtime_file
+            rt_dir = runtime_file("backend", "artifacts")
+            if rt_dir.resolve() != proj_backend_dir.resolve():
+                rt_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path_obj, rt_dir / filename)
+        except Exception:
+            pass
+
+        return target_file
+    except Exception as exc:
+        logger.debug("Artifact staging to backend directory skipped or failed: %s", exc)
+        return None
 
 
 # ── Execution Result Dataclass ──────────────────────────────────────────────
@@ -498,20 +638,22 @@ class DocumentGenerator:
         sections: List[Dict[str, Any]],
         filename: str = "report.docx",
         metadata: Optional[Dict[str, Any]] = None,
+        summary: Optional[str] = None,
+        citations: Optional[List[Any]] = None,
+        conclusion: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Create and save a formatted .docx report inside the sandbox.
 
         Parameters
         ----------
-        title    : Main report title
-        sections : List of dicts, each with keys like:
-                   - 'heading': section title
-                   - 'content': body paragraph
-                   - 'bullets': list of bullet items
-                   - 'table': dict with {'headers': [...], 'rows': [[...], ...]}
-                   - 'callout': highlight/safety note
-        filename : output filename within the sandbox
-        metadata : optional dict of document metadata (author, equipment tag, date)
+        title      : Main report title
+        sections   : List of dicts with heading, content, bullets, table, callout
+        filename   : Output filename within the sandbox
+        metadata   : Optional document metadata (author, equipment tag, date)
+        summary    : Optional executive summary
+        citations  : Optional list of Citation objects
+        conclusion : Optional conclusion text
         """
         import docx
         from docx.shared import Inches, Pt, RGBColor
@@ -547,17 +689,39 @@ class DocumentGenerator:
 
         doc.add_paragraph()  # spacing
 
+        # Executive Summary
+        if summary:
+            h_sum = doc.add_heading("Executive Summary", level=1)
+            h_sum.runs[0].font.color.rgb = RGBColor(24, 76, 120)
+            p_sum = doc.add_paragraph(summary)
+            p_sum.paragraph_format.line_spacing = 1.15
+            doc.add_paragraph()
+
         # Populate Sections
         for sec in sections:
-            heading_text = sec.get("heading")
+            heading_text = sec.get("heading") or sec.get("title")
             if heading_text:
                 h = doc.add_heading(heading_text, level=1)
                 h.runs[0].font.color.rgb = RGBColor(24, 76, 120)
 
-            content_text = sec.get("content")
+            content_text = sec.get("content") or sec.get("text") or sec.get("body")
             if content_text:
-                p = doc.add_paragraph(content_text)
-                p.paragraph_format.line_spacing = 1.15
+                if isinstance(content_text, str):
+                    for p_t in content_text.strip().split("\n\n"):
+                        if p_t.strip():
+                            p = doc.add_paragraph(p_t.strip())
+                            p.paragraph_format.line_spacing = 1.15
+                elif isinstance(content_text, list):
+                    for p_t in content_text:
+                        p = doc.add_paragraph(str(p_t))
+                        p.paragraph_format.line_spacing = 1.15
+
+            # Paragraphs list
+            paragraphs = sec.get("paragraphs", [])
+            for p_text in paragraphs:
+                if p_text:
+                    p = doc.add_paragraph(str(p_text))
+                    p.paragraph_format.line_spacing = 1.15
 
             # Bullet points
             bullets = sec.get("bullets", [])
@@ -575,7 +739,7 @@ class DocumentGenerator:
 
             # Table
             tbl_data = sec.get("table")
-            if tbl_data and "headers" in tbl_data and "rows" in tbl_data:
+            if tbl_data and isinstance(tbl_data, dict) and "headers" in tbl_data and "rows" in tbl_data:
                 headers = tbl_data["headers"]
                 rows = tbl_data["rows"]
                 table = doc.add_table(rows=1 + len(rows), cols=len(headers))
@@ -602,10 +766,61 @@ class DocumentGenerator:
 
             doc.add_paragraph()  # spacing between sections
 
+        # Sources & Citations
+        if citations:
+            h_cite = doc.add_heading("Sources & Regulatory Evidence", level=1)
+            h_cite.runs[0].font.color.rgb = RGBColor(24, 76, 120)
+            seen_cites = set()
+            for idx, c in enumerate(citations, 1):
+                doc_name = getattr(c, "document_name", None) or getattr(c, "document_id", "Document")
+                page = getattr(c, "page_number", None)
+                sec_title = getattr(c, "section_title", None)
+                tag = getattr(c, "equipment_tag", None)
+                quote = (getattr(c, "verbatim_quote", None) or "").strip()
+                k = (str(doc_name), str(page), str(sec_title), str(tag), quote[:60])
+                if k in seen_cites:
+                    continue
+                seen_cites.add(k)
+
+                anchor = getattr(c, "citation_id", None) or f"[{idx}]"
+                if not str(anchor).startswith("["):
+                    anchor = f"[{anchor}]"
+                page_str = f"Page {page}" if page else None
+                sec_str = f"Section: {sec_title}" if sec_title else None
+                tag_str = f"Tag: {tag}" if tag else None
+                meta_parts = [p for p in [page_str, sec_str, tag_str] if p]
+                meta_str = f" ({' | '.join(meta_parts)})" if meta_parts else ""
+
+                cp = doc.add_paragraph()
+                c_run1 = cp.add_run(f"{anchor} {doc_name}{meta_str}")
+                c_run1.bold = True
+                c_run1.font.size = Pt(9.5)
+
+                if quote:
+                    qp = doc.add_paragraph()
+                    qp.paragraph_format.left_indent = Inches(0.25)
+                    q_run = qp.add_run(f'"{quote}"')
+                    q_run.italic = True
+                    q_run.font.size = Pt(8.5)
+                    q_run.font.color.rgb = RGBColor(100, 110, 120)
+
+        # Conclusion
+        if conclusion:
+            h_concl = doc.add_heading("Conclusion & Statutory Remarks", level=1)
+            h_concl.runs[0].font.color.rgb = RGBColor(24, 76, 120)
+            p_concl = doc.add_paragraph(conclusion)
+            p_concl.paragraph_format.line_spacing = 1.15
+
         # Save document inside sandbox safely
         safe_path = self.file_manager._resolve_safe_path(filename)
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         doc.save(str(safe_path))
+
+        if not safe_path.is_file() or safe_path.stat().st_size == 0:
+            raise RuntimeError(f"DOCX generation failed: file '{safe_path}' was not written or is empty.")
+        validate_artifact(safe_path, "docx", citations)
+
+        stage_artifact_for_backend(safe_path)
 
         return {
             "status": "success",
@@ -620,25 +835,8 @@ class DocumentGenerator:
 # ── 6. Spreadsheet Generator (openpyxl) ───────────────────────────────────
 
 class SpreadsheetGenerator:
-    """Generates Excel (.xlsx) workbooks with styled headers and data rows.
+    """Generates Excel (.xlsx) workbooks with styled headers and data rows."""
 
-    Input structure (`workbook` dict):
-      {
-        "title": str,
-        "sheets": [
-          {
-            "name": str,
-            "headers": [str, ...],
-            "rows": [[value, ...], ...],
-            "metadata": {key: value, ...}   # optional; placed as info rows above table
-          },
-          ...
-        ]
-      }
-    If `workbook` is None a sample single-sheet workbook is generated.
-    """
-
-    # Colour palette (ARGB hex strings for openpyxl)
     _HEADER_FILL    = "FF102C57"   # deep navy
     _ALT_ROW_FILL   = "FFE8EEF5"   # light blue-grey
     _BORDER_COLOUR  = "FFB0BEC5"
@@ -651,29 +849,99 @@ class SpreadsheetGenerator:
         workbook: Optional[Dict[str, Any]] = None,
         filename: str = "report.xlsx",
         metadata: Optional[Dict[str, Any]] = None,
+        title: Optional[str] = None,
+        sections: Optional[List[Dict[str, Any]]] = None,
+        citations: Optional[List[Any]] = None,
+        summary: Optional[str] = None,
+        conclusion: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Create and save a styled .xlsx workbook inside the sandbox."""
         import openpyxl
         from openpyxl.styles import (
-            PatternFill, Font, Alignment, Border, Side, GradientFill
+            PatternFill, Font, Alignment, Border, Side
         )
         from openpyxl.utils import get_column_letter
 
-        wb_spec = workbook or {
-            "title": "Agent Workbench Report",
-            "sheets": [
-                {
+        wb_spec = workbook
+        if not wb_spec:
+            sheets_spec = []
+            findings_rows = []
+            if sections:
+                for sec in sections:
+                    sec_name = sec.get("heading") or sec.get("title") or "General"
+                    tbl = sec.get("table")
+                    if tbl and isinstance(tbl, dict) and "headers" in tbl and "rows" in tbl:
+                        for row in tbl["rows"]:
+                            findings_rows.append([sec_name] + [str(c) for c in row])
+                    bullets = sec.get("bullets", [])
+                    for b in bullets:
+                        parts = str(b).split(":", 1)
+                        if len(parts) == 2:
+                            findings_rows.append([sec_name, parts[0].strip(), parts[1].strip(), "Documented"])
+                        else:
+                            findings_rows.append([sec_name, "Finding", str(b), "Documented"])
+                    content = sec.get("content") or ""
+                    if content and not bullets and not tbl:
+                        for line in str(content).split("\n"):
+                            line_str = line.strip().lstrip("-*• ")
+                            if line_str:
+                                parts = line_str.split(":", 1)
+                                if len(parts) == 2:
+                                    findings_rows.append([sec_name, parts[0].strip(), parts[1].strip(), "Documented"])
+                                else:
+                                    findings_rows.append([sec_name, "Detail", line_str, "Documented"])
+
+            if findings_rows:
+                max_cols = max(len(r) for r in findings_rows)
+                default_headers = ["Section / Entity", "Parameter / Key", "Documented Value / Observation", "Status"]
+                while len(default_headers) < max_cols:
+                    default_headers.append(f"Field {len(default_headers)+1}")
+                norm_rows = []
+                for r in findings_rows:
+                    padded = r + [""] * (len(default_headers) - len(r))
+                    norm_rows.append(padded[:len(default_headers)])
+
+                sheets_spec.append({
+                    "name": "Documented Findings",
+                    "headers": default_headers,
+                    "rows": norm_rows,
+                })
+            else:
+                sheets_spec.append({
                     "name": "Summary",
-                    "headers": ["Parameter", "Value", "Unit", "Status"],
+                    "headers": ["Entity", "Parameter", "Documented Value", "Unit", "Observation", "Source Document", "Page"],
                     "rows": [
-                        ["Design Pressure", "10.5", "kg/cm²g", "EXTRACTED"],
-                        ["Shell Min Thickness", "11.2", "mm", "EXTRACTED"],
-                        ["Calculated t_min", "5.40", "mm", "CALCULATED"],
-                        ["Safety Margin", "5.80", "mm", "ACCEPTABLE"],
+                        ["Summary", "Finding", "Not documented in the available evidence.", "-", "-", "-", "-"],
                     ],
-                }
-            ],
-        }
+                })
+
+            if citations:
+                cite_rows = []
+                seen_cites = set()
+                for idx, c in enumerate(citations, 1):
+                    c_id = getattr(c, "citation_id", None) or f"[{idx}]"
+                    doc_name = getattr(c, "document_name", None) or getattr(c, "document_id", "Unknown Document")
+                    page = str(getattr(c, "page_number", "N/A") or "N/A")
+                    sec_title = str(getattr(c, "section_title", "N/A") or "N/A")
+                    tag = str(getattr(c, "equipment_tag", "N/A") or "N/A")
+                    quote = str(getattr(c, "verbatim_quote", "") or "").replace("\n", " ").strip()
+                    k = (str(doc_name), page, sec_title, tag, quote[:60])
+                    if k in seen_cites:
+                        continue
+                    seen_cites.add(k)
+                    cite_rows.append([c_id, doc_name, page, sec_title, tag, quote])
+
+                sheets_spec.append({
+                    "name": "Source Provenance",
+                    "headers": ["Citation ID", "Document Name", "Page", "Section", "Equipment Tag", "Verbatim Evidence"],
+                    "rows": cite_rows,
+                })
+
+            wb_spec = {
+                "title": title or "Sovereign AI Engineering Report",
+                "sheets": sheets_spec,
+            }
 
         wb = openpyxl.Workbook()
         wb.remove(wb.active)   # remove default empty sheet
@@ -687,9 +955,9 @@ class SpreadsheetGenerator:
         thin_border  = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
         for sheet_spec in wb_spec.get("sheets", []):
-            ws = wb.create_sheet(title=sheet_spec.get("name", "Sheet"))
+            ws = wb.create_sheet(title=sheet_spec.get("name", "Sheet")[:31])
 
-            # ── Title row ────────────────────────────────────────────────
+            # Title row
             ws.merge_cells("A1:H1")
             ws["A1"] = f"{title_str}  |  Generated: {gen_date}"
             ws["A1"].font = Font(bold=True, size=13, color="FFFFFFFF")
@@ -697,7 +965,6 @@ class SpreadsheetGenerator:
             ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
             ws.row_dimensions[1].height = 24
 
-            # ── Optional metadata rows ───────────────────────────────────
             row_cursor = 2
             meta_items = {**(metadata or {}), **sheet_spec.get("metadata", {})}
             if meta_items:
@@ -705,9 +972,8 @@ class SpreadsheetGenerator:
                     ws.cell(row=row_cursor, column=1, value=str(k)).font = Font(bold=True, size=9, color="FF102C57")
                     ws.cell(row=row_cursor, column=2, value=str(v)).font = Font(size=9)
                     row_cursor += 1
-                row_cursor += 1   # blank separator
+                row_cursor += 1
 
-            # ── Header row ──────────────────────────────────────────────
             headers = sheet_spec.get("headers", [])
             for col_idx, h_text in enumerate(headers, start=1):
                 cell = ws.cell(row=row_cursor, column=col_idx, value=str(h_text))
@@ -719,7 +985,6 @@ class SpreadsheetGenerator:
             header_row = row_cursor
             row_cursor += 1
 
-            # ── Data rows ───────────────────────────────────────────────
             for r_idx, row_vals in enumerate(sheet_spec.get("rows", [])):
                 fill = alt_row_fill if r_idx % 2 == 1 else None
                 for col_idx, val in enumerate(row_vals, start=1):
@@ -730,7 +995,6 @@ class SpreadsheetGenerator:
                         cell.fill = fill
                 row_cursor += 1
 
-            # ── Auto-fit column widths ───────────────────────────────────
             for col in ws.columns:
                 max_len = 0
                 col_letter = get_column_letter(col[0].column)
@@ -739,14 +1003,19 @@ class SpreadsheetGenerator:
                         max_len = max(max_len, len(str(cell.value or "")))
                     except Exception:
                         pass
-                ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
+                ws.column_dimensions[col_letter].width = min(max_len + 4, 45)
 
             ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
 
-        # Save to sandbox
         safe_path = self.file_manager._resolve_safe_path(filename)
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         wb.save(str(safe_path))
+
+        if not safe_path.is_file() or safe_path.stat().st_size == 0:
+            raise RuntimeError(f"XLSX generation failed: file '{safe_path}' was not written or is empty.")
+        validate_artifact(safe_path, "xlsx", citations)
+
+        stage_artifact_for_backend(safe_path)
 
         return {
             "status": "success",
@@ -757,18 +1026,11 @@ class SpreadsheetGenerator:
         }
 
 
+
 # ── 7. Presentation Generator (python-pptx) ────────────────────────────────
 
 class PresentationGenerator:
-    """Generates PowerPoint (.pptx) presentations with a branded theme.
-
-    Input structure (`slides` list):
-      [
-        {"title": str, "content": str | List[str], "bullets": [str,...], "table": {...}},
-        ...
-      ]
-    First slide is always a title-card; subsequent slides use a body layout.
-    """
+    """Generates PowerPoint (.pptx) presentations with a branded theme."""
 
     def __init__(self, file_manager: SandboxedFileManager) -> None:
         self.file_manager = file_manager
@@ -779,15 +1041,18 @@ class PresentationGenerator:
         slides: Optional[List[Dict[str, Any]]] = None,
         filename: str = "report.pptx",
         metadata: Optional[Dict[str, Any]] = None,
+        summary: Optional[str] = None,
+        sections: Optional[List[Dict[str, Any]]] = None,
+        citations: Optional[List[Any]] = None,
+        conclusion: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Create and save a styled .pptx presentation inside the sandbox."""
         from pptx import Presentation
-        from pptx.util import Inches, Pt, Emu
+        from pptx.util import Inches, Pt
         from pptx.dml.color import RGBColor
         from pptx.enum.text import PP_ALIGN
-        from pptx.util import Inches, Pt
 
-        # Theme colours
         NAVY  = RGBColor(0x10, 0x2C, 0x57)   # deep industrial navy
         WHITE = RGBColor(0xFF, 0xFF, 0xFF)
         SLATE = RGBColor(0x64, 0x6E, 0x78)   # steel grey
@@ -798,12 +1063,9 @@ class PresentationGenerator:
         prs.slide_width  = Inches(13.33)
         prs.slide_height = Inches(7.5)
 
-        blank_layout = prs.slide_layouts[6]   # completely blank
+        blank_layout = prs.slide_layouts[6]
 
         def _set_bg(slide, colour: RGBColor) -> None:
-            """Fill slide background with solid colour."""
-            from pptx.oxml.ns import qn
-            from lxml import etree
             bg = slide.background
             fill = bg.fill
             fill.solid()
@@ -825,40 +1087,72 @@ class PresentationGenerator:
             run.font.color.rgb = colour
             return txb
 
-        # ── Slide 1: Title card ─────────────────────────────────────────
+        # Slide 1: Title card
         title_slide = prs.slides.add_slide(blank_layout)
         _set_bg(title_slide, NAVY)
 
-        # Accent bar (top)
-        bar = title_slide.shapes.add_shape(
-            1, Inches(0), Inches(0), Inches(13.33), Inches(0.35)
-        )  # 1 = MSO_SHAPE_TYPE.RECTANGLE
+        bar = title_slide.shapes.add_shape(1, Inches(0), Inches(0), Inches(13.33), Inches(0.35))
         bar.fill.solid()
         bar.fill.fore_color.rgb = AMBER
         bar.line.fill.background()
 
         _add_textbox(title_slide, 0.6, 1.5, 12, 1.4, title, bold=True, size=32, colour=WHITE, align=PP_ALIGN.CENTER)
         subtitle = f"Sovereign AI Engineering Workbench  |  {gen_date}"
-        _add_textbox(title_slide, 0.6, 3.0, 12, 0.6, subtitle, bold=False, size=14, colour=SLATE.__class__(0xAA, 0xC4, 0xE0), align=PP_ALIGN.CENTER)
+        _add_textbox(title_slide, 0.6, 3.0, 12, 0.6, subtitle, bold=False, size=14, colour=RGBColor(0xAA, 0xC4, 0xE0), align=PP_ALIGN.CENTER)
         if metadata:
             meta_str = "  •  ".join(f"{k}: {v}" for k, v in metadata.items())
-            _add_textbox(title_slide, 0.6, 3.8, 12, 0.5, meta_str, size=11, colour=SLATE.__class__(0xAA, 0xC4, 0xE0), align=PP_ALIGN.CENTER)
+            _add_textbox(title_slide, 0.6, 3.8, 12, 0.5, meta_str, size=11, colour=RGBColor(0xAA, 0xC4, 0xE0), align=PP_ALIGN.CENTER)
 
-        # Footer bar
         footer_bar = title_slide.shapes.add_shape(1, Inches(0), Inches(7.15), Inches(13.33), Inches(0.35))
         footer_bar.fill.solid()
         footer_bar.fill.fore_color.rgb = AMBER
         footer_bar.line.fill.background()
 
-        # ── Content slides ──────────────────────────────────────────────
-        slide_specs = slides or [
-            {"title": "Executive Summary", "content": "No content provided."},
-        ]
+        # Build slides if not provided
+        slide_specs = slides
+        if not slide_specs:
+            slide_specs = []
+            if summary:
+                slide_specs.append({"title": "Executive Summary", "content": summary})
+            if sections:
+                for sec in sections:
+                    heading = sec.get("heading") or sec.get("title") or "Key Findings"
+                    slide_specs.append({
+                        "title": heading,
+                        "content": sec.get("content"),
+                        "bullets": sec.get("bullets", []),
+                        "table": sec.get("table"),
+                    })
+            if citations:
+                cite_bullets = []
+                seen_cites = set()
+                for idx, c in enumerate(citations, 1):
+                    doc_name = getattr(c, "document_name", None) or getattr(c, "document_id", "Doc")
+                    page = f"p.{getattr(c, 'page_number', '')}" if getattr(c, "page_number", None) else ""
+                    quote = (getattr(c, "verbatim_quote", "") or "").strip()
+                    k = (str(doc_name), page, quote[:60])
+                    if k in seen_cites:
+                        continue
+                    seen_cites.add(k)
+                    anchor = getattr(c, "citation_id", None) or f"[{idx}]"
+                    q_trunc = quote
+                    if len(q_trunc) > 100:
+                        q_trunc = q_trunc[:97] + "..."
+                    cite_bullets.append(f"{anchor} {doc_name} {page} - \"{q_trunc}\"")
+                    if len(cite_bullets) >= 5:
+                        break
+                if cite_bullets:
+                    slide_specs.append({"title": "Sources & Regulatory Provenance", "bullets": cite_bullets})
+            if conclusion:
+                slide_specs.append({"title": "Conclusion & Remarks", "content": conclusion})
+
+        if not slide_specs:
+            slide_specs = [{"title": "Executive Summary", "content": "No content provided."}]
+
         for slide_spec in slide_specs:
             s = prs.slides.add_slide(blank_layout)
             _set_bg(s, WHITE)
 
-            # Header band
             hdr = s.shapes.add_shape(1, Inches(0), Inches(0), Inches(13.33), Inches(1.1))
             hdr.fill.solid()
             hdr.fill.fore_color.rgb = NAVY
@@ -869,7 +1163,6 @@ class PresentationGenerator:
 
             y_cursor = 1.3
 
-            # Body text / content
             content = slide_spec.get("content", "")
             if isinstance(content, list):
                 content = "\n".join(content)
@@ -877,7 +1170,6 @@ class PresentationGenerator:
                 _add_textbox(s, 0.5, y_cursor, 12.3, 1.2, content, size=13, colour=NAVY)
                 y_cursor += 1.4
 
-            # Bullet points
             bullets = slide_spec.get("bullets", [])
             if bullets:
                 bullet_text = "\n".join(f"  •  {b}" for b in bullets)
@@ -885,7 +1177,6 @@ class PresentationGenerator:
                              bullet_text, size=12, colour=NAVY)
                 y_cursor += min(3.2, 0.4 * len(bullets) + 0.5)
 
-            # Simple table via add_table
             tbl_data = slide_spec.get("table")
             if tbl_data and "headers" in tbl_data and "rows" in tbl_data:
                 headers = tbl_data["headers"]
@@ -903,7 +1194,7 @@ class PresentationGenerator:
                 tbl = tbl_shape.table
                 for c_idx, h in enumerate(headers):
                     cell = tbl.cell(0, c_idx)
-                    cell.text = h
+                    cell.text = str(h)
                     cell.text_frame.paragraphs[0].runs[0].font.bold = True
                     cell.text_frame.paragraphs[0].runs[0].font.size = Pt(10)
                     cell.text_frame.paragraphs[0].runs[0].font.color.rgb = WHITE
@@ -915,16 +1206,20 @@ class PresentationGenerator:
                             tbl.cell(r_idx + 1, c_idx).text = str(val)
                             tbl.cell(r_idx + 1, c_idx).text_frame.paragraphs[0].runs[0].font.size = Pt(9)
 
-            # Footer bar
             fb = s.shapes.add_shape(1, Inches(0), Inches(7.15), Inches(13.33), Inches(0.35))
             fb.fill.solid()
             fb.fill.fore_color.rgb = AMBER
             fb.line.fill.background()
 
-        # Save to sandbox
         safe_path = self.file_manager._resolve_safe_path(filename)
         safe_path.parent.mkdir(parents=True, exist_ok=True)
         prs.save(str(safe_path))
+
+        if not safe_path.is_file() or safe_path.stat().st_size == 0:
+            raise RuntimeError(f"PPTX generation failed: file '{safe_path}' was not written or is empty.")
+        validate_artifact(safe_path, "pptx", citations)
+
+        stage_artifact_for_backend(safe_path)
 
         return {
             "status": "success",
@@ -935,19 +1230,320 @@ class PresentationGenerator:
         }
 
 
-# ── 8. PDF Converter ────────────────────────────────────────────────────────
+# ── 8. Native PDF Generator & Converter ───────────────────────────────────
 
-class PDFConverter:
-    """Converts an existing .docx file in the sandbox to PDF.
+class NativePDFGenerator:
+    """Offline, air-gapped PDF document generator powered by ReportLab Platypus.
 
-    Conversion priority (fully offline, no network calls):
-      1. docx2pdf — uses Microsoft Word COM on Windows if Word is installed.
-      2. libreoffice --headless --convert-to pdf — requires LibreOffice in PATH.
-      3. Returns capability_unavailable with a clear message if neither is present.
+    Constructs styled, professional engineering and compliance PDF reports directly
+    from structured grounded content without requiring Microsoft Word or LibreOffice.
     """
 
     def __init__(self, file_manager: SandboxedFileManager) -> None:
         self.file_manager = file_manager
+
+    def generate(
+        self,
+        title: str = "Engineering & Compliance Report",
+        sections: Optional[List[Dict[str, Any]]] = None,
+        filename: str = "report.pdf",
+        metadata: Optional[Dict[str, Any]] = None,
+        citations: Optional[List[Any]] = None,
+        summary: Optional[str] = None,
+        conclusion: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Create and save a professionally formatted PDF inside the sandbox."""
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether, HRFlowable
+        )
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from xml.sax.saxutils import escape as xml_escape
+
+        safe_path = self.file_manager._resolve_safe_path(filename)
+        safe_path.parent.mkdir(parents=True, exist_ok=True)
+
+        doc = SimpleDocTemplate(
+            str(safe_path),
+            pagesize=letter,
+            leftMargin=0.75 * inch,
+            rightMargin=0.75 * inch,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
+        )
+
+        styles = getSampleStyleSheet()
+
+        c_navy = colors.HexColor("#102C57")
+        c_blue = colors.HexColor("#1E3A8A")
+        c_slate = colors.HexColor("#334155")
+        c_grey = colors.HexColor("#64748B")
+        c_bg_alt = colors.HexColor("#F1F5F9")
+        c_callout_bg = colors.HexColor("#FEF2F2")
+        c_callout_border = colors.HexColor("#DC2626")
+
+        title_style = ParagraphStyle(
+            "PDFDocTitle",
+            parent=styles["Heading1"],
+            fontName="Helvetica-Bold",
+            fontSize=18,
+            leading=22,
+            textColor=c_navy,
+            alignment=1,
+            spaceAfter=6,
+        )
+
+        meta_style = ParagraphStyle(
+            "PDFDocMeta",
+            parent=styles["Normal"],
+            fontName="Helvetica-Oblique",
+            fontSize=8.5,
+            leading=11,
+            textColor=c_grey,
+            alignment=1,
+            spaceAfter=8,
+        )
+
+        h1_style = ParagraphStyle(
+            "PDFDocH1",
+            parent=styles["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=12,
+            leading=15,
+            textColor=c_navy,
+            spaceBefore=10,
+            spaceAfter=5,
+            keepWithNext=True,
+        )
+
+        body_style = ParagraphStyle(
+            "PDFDocBody",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=9.5,
+            leading=13.5,
+            textColor=c_slate,
+            spaceAfter=6,
+        )
+
+        bullet_style = ParagraphStyle(
+            "PDFDocBullet",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=13,
+            textColor=c_slate,
+            leftIndent=15,
+            firstLineIndent=-10,
+            spaceAfter=4,
+        )
+
+        callout_style = ParagraphStyle(
+            "PDFDocCallout",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=9,
+            leading=13,
+            textColor=colors.HexColor("#991B1B"),
+        )
+
+        cite_style = ParagraphStyle(
+            "PDFDocCite",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8.5,
+            leading=12,
+            textColor=c_slate,
+            leftIndent=10,
+            spaceAfter=3,
+        )
+
+        story = []
+
+        # Title
+        clean_title = xml_escape(title or "Engineering Report")
+        story.append(Paragraph(clean_title, title_style))
+
+        # Metadata block
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        meta_lines = [f"MRPL Sovereign AI Workbench  |  Generated: {now_str}"]
+        if metadata:
+            meta_parts = [f"{xml_escape(str(k))}: {xml_escape(str(v))}" for k, v in metadata.items()]
+            meta_lines.append("  •  ".join(meta_parts))
+        story.append(Paragraph("<br/>".join(meta_lines), meta_style))
+        story.append(HRFlowable(width="100%", thickness=1, color=c_navy, spaceBefore=2, spaceAfter=10))
+
+        # Summary
+        if summary:
+            story.append(Paragraph("Executive Summary", h1_style))
+            story.append(Paragraph(xml_escape(summary).replace("\n", "<br/>"), body_style))
+            story.append(Spacer(1, 4))
+
+        # Sections
+        sec_list = sections or []
+        for sec in sec_list:
+            heading = sec.get("heading") or sec.get("title")
+            if heading:
+                story.append(Paragraph(xml_escape(str(heading)), h1_style))
+
+            content = sec.get("content") or sec.get("text") or sec.get("body")
+            if content:
+                if isinstance(content, str):
+                    paras = content.strip().split("\n\n")
+                    for p_text in paras:
+                        if p_text.strip():
+                            story.append(Paragraph(xml_escape(p_text.strip()).replace("\n", "<br/>"), body_style))
+                elif isinstance(content, list):
+                    for p_text in content:
+                        story.append(Paragraph(xml_escape(str(p_text)).replace("\n", "<br/>"), body_style))
+
+            paragraphs = sec.get("paragraphs", [])
+            for p_text in paragraphs:
+                if p_text:
+                    story.append(Paragraph(xml_escape(str(p_text)).replace("\n", "<br/>"), body_style))
+
+            bullets = sec.get("bullets", [])
+            for b in bullets:
+                story.append(Paragraph(f"&bull; {xml_escape(str(b))}", bullet_style))
+
+            callout = sec.get("callout")
+            if callout:
+                callout_p = Paragraph(f"<b>CRITICAL NOTE:</b> {xml_escape(str(callout))}", callout_style)
+                callout_tbl = Table([[callout_p]], colWidths=[7.0 * inch])
+                callout_tbl.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), c_callout_bg),
+                    ("BOX", (0, 0), (-1, -1), 1, c_callout_border),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ]))
+                story.append(Spacer(1, 4))
+                story.append(callout_tbl)
+                story.append(Spacer(1, 4))
+
+            tbl_data = sec.get("table")
+            if tbl_data and isinstance(tbl_data, dict) and "headers" in tbl_data and "rows" in tbl_data:
+                headers = tbl_data["headers"]
+                rows = tbl_data["rows"]
+                num_cols = len(headers)
+                if num_cols > 0:
+                    col_w = (7.0 * inch) / num_cols
+                    table_rows = []
+
+                    hdr_row = [
+                        Paragraph(f"<b>{xml_escape(str(h))}</b>", ParagraphStyle("TH", parent=body_style, fontSize=8.5, leading=10.5, textColor=colors.white, alignment=1))
+                        for h in headers
+                    ]
+                    table_rows.append(hdr_row)
+
+                    for r_idx, r in enumerate(rows):
+                        row_cells = [
+                            Paragraph(xml_escape(str(cell)), ParagraphStyle(f"TD_{r_idx}", parent=body_style, fontSize=8, leading=10.5))
+                            for cell in r
+                        ]
+                        table_rows.append(row_cells)
+
+                    t_elem = Table(table_rows, colWidths=[col_w] * num_cols)
+                    t_style = [
+                        ("BACKGROUND", (0, 0), (-1, 0), c_navy),
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+                        ("BOX", (0, 0), (-1, -1), 1, c_navy),
+                        ("TOPPADDING", (0, 0), (-1, -1), 3),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ]
+                    for r_i in range(1, len(table_rows)):
+                        if r_i % 2 == 0:
+                            t_style.append(("BACKGROUND", (0, r_i), (-1, r_i), c_bg_alt))
+                    t_elem.setStyle(TableStyle(t_style))
+                    story.append(Spacer(1, 4))
+                    story.append(t_elem)
+                    story.append(Spacer(1, 4))
+
+            story.append(Spacer(1, 4))
+
+        # Citations / Sources
+        if citations:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph("Sources & Regulatory Evidence", h1_style))
+            seen_cites = set()
+            for idx, c in enumerate(citations, 1):
+                doc_name = getattr(c, "document_name", None) or getattr(c, "document_id", "Document")
+                page = getattr(c, "page_number", None)
+                sec_title = getattr(c, "section_title", None)
+                tag = getattr(c, "equipment_tag", None)
+                quote = (getattr(c, "verbatim_quote", None) or "").strip()
+                k = (str(doc_name), str(page), str(sec_title), str(tag), quote[:60])
+                if k in seen_cites:
+                    continue
+                seen_cites.add(k)
+
+                anchor = getattr(c, "citation_id", None) or f"[{idx}]"
+                if not str(anchor).startswith("["):
+                    anchor = f"[{anchor}]"
+                page_str = f"Page {page}" if page else None
+                sec_str = f"Section: {sec_title}" if sec_title else None
+                tag_str = f"Tag: {tag}" if tag else None
+
+                meta_parts = [p for p in [page_str, sec_str, tag_str] if p]
+                meta_str = f" ({' | '.join(meta_parts)})" if meta_parts else ""
+
+                story.append(Paragraph(f"<b>{xml_escape(anchor)}</b> {xml_escape(str(doc_name))}{xml_escape(meta_str)}", cite_style))
+                if quote:
+                    q_clean = xml_escape(quote.replace("\n", " "))
+                    if len(q_clean) > 180:
+                        q_clean = q_clean[:177] + "..."
+                    story.append(Paragraph(f'<i>"{q_clean}"</i>', ParagraphStyle("Quote", parent=cite_style, leftIndent=20, fontSize=8, textColor=c_grey)))
+
+        # Conclusion
+        if conclusion:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph("Conclusion & Statutory Remarks", h1_style))
+            story.append(Paragraph(xml_escape(conclusion).replace("\n", "<br/>"), body_style))
+
+        doc.build(story)
+
+        if not safe_path.is_file() or safe_path.stat().st_size == 0:
+            raise RuntimeError(f"PDF generation failed: output file '{safe_path}' was not written or is 0 bytes.")
+
+        header_bytes = safe_path.read_bytes()[:10]
+        if not header_bytes.startswith(b"%PDF-"):
+            raise ValueError(f"Generated file '{safe_path}' lacks a valid PDF header (%PDF-).")
+        validate_artifact(safe_path, "pdf", citations)
+
+        num_pages = 1
+        try:
+            import fitz
+            doc_fitz = fitz.open(str(safe_path))
+            num_pages = len(doc_fitz)
+            doc_fitz.close()
+        except Exception:
+            pass
+
+        stage_artifact_for_backend(safe_path)
+
+        return {
+            "status": "success",
+            "generator": "reportlab_native",
+            "filename": safe_path.name,
+            "path": str(safe_path),
+            "file_size_bytes": safe_path.stat().st_size,
+            "pages": num_pages,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+class PDFConverter:
+    """Converts an existing .docx file in the sandbox to PDF, with ReportLab fallback."""
+
+    def __init__(self, file_manager: SandboxedFileManager, native_generator: Optional[NativePDFGenerator] = None) -> None:
+        self.file_manager = file_manager
+        self.native_generator = native_generator or NativePDFGenerator(file_manager)
 
     @staticmethod
     def _find_libreoffice() -> Optional[str]:
@@ -979,13 +1575,7 @@ class PDFConverter:
         docx_filename: str,
         out_filename: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Convert a .docx file in the sandbox to PDF.
-
-        Parameters
-        ----------
-        docx_filename : Relative path to the .docx inside the sandbox.
-        out_filename  : Output PDF filename (defaults to same name with .pdf extension).
-        """
+        """Convert a .docx file in the sandbox to PDF."""
         docx_path = self.file_manager._resolve_safe_path(docx_filename)
         if not docx_path.is_file():
             raise FileNotFoundError(f"Source .docx not found in sandbox: {docx_filename}")
@@ -1002,6 +1592,7 @@ class PDFConverter:
             d2p_convert = getattr(d2p, "convert")
             d2p_convert(str(docx_path), str(pdf_path))
             if pdf_path.is_file() and pdf_path.stat().st_size > 0:
+                stage_artifact_for_backend(pdf_path)
                 return {
                     "status": "success",
                     "converter": "docx2pdf",
@@ -1012,7 +1603,7 @@ class PDFConverter:
         except (ImportError, ModuleNotFoundError):
             pass
         except Exception as exc:
-            logger.warning("docx2pdf conversion failed (%s); trying libreoffice.", exc)
+            logger.warning("docx2pdf conversion failed (%s); trying fallback.", exc)
 
         # ── Strategy 2: LibreOffice headless ─────────────────────────
         lo_bin = self._find_libreoffice()
@@ -1024,11 +1615,11 @@ class PDFConverter:
                      "--outdir", out_dir, str(docx_path)],
                     capture_output=True, text=True, timeout=60,
                 )
-                # LibreOffice writes <docx_stem>.pdf in outdir
                 lo_out = pdf_path.parent / (docx_path.stem + ".pdf")
                 if lo_out.is_file() and lo_out.stat().st_size > 0:
                     if lo_out != pdf_path:
                         lo_out.rename(pdf_path)
+                    stage_artifact_for_backend(pdf_path)
                     return {
                         "status": "success",
                         "converter": "libreoffice",
@@ -1036,18 +1627,39 @@ class PDFConverter:
                         "path": str(pdf_path),
                         "file_size_bytes": pdf_path.stat().st_size,
                     }
-                else:
-                    raise RuntimeError(
-                        f"LibreOffice exited {proc.returncode}; stderr: {proc.stderr[:300]}"
-                    )
             except Exception as exc:
                 logger.warning("LibreOffice conversion failed: %s", exc)
 
-        # ── Neither converter available ───────────────────────────────
+        # ── Strategy 3: ReportLab native conversion fallback ─────────
+        try:
+            import docx
+            doc = docx.Document(str(docx_path))
+            sections = []
+            current_sec = {"heading": "", "paragraphs": [], "table": None}
+            for p in doc.paragraphs:
+                txt = p.text.strip()
+                if not txt:
+                    continue
+                if p.style.name.startswith("Heading"):
+                    if current_sec["paragraphs"]:
+                        sections.append(current_sec)
+                    current_sec = {"heading": txt, "paragraphs": [], "table": None}
+                else:
+                    current_sec["paragraphs"].append(txt)
+            if current_sec["paragraphs"] or current_sec["heading"]:
+                sections.append(current_sec)
+
+            return self.native_generator.generate(
+                title=docx_path.stem.replace("_", " ").title(),
+                sections=sections,
+                filename=out_filename,
+            )
+        except Exception as exc:
+            logger.warning("ReportLab docx fallback failed: %s", exc)
+
         raise RuntimeError(
-            "PDF conversion requires either docx2pdf (with Microsoft Word installed) "
-            "or LibreOffice (soffice/libreoffice in PATH). "
-            "Neither was found on this system."
+            "PDF conversion requires either docx2pdf (with Microsoft Word installed), "
+            "LibreOffice (soffice/libreoffice in PATH), or ReportLab."
         )
 
 
@@ -1063,20 +1675,22 @@ class VisionInspectorTool:
     def __init__(self, sandbox_dir: Path, project_root: Path = DEFAULT_PROJECT_ROOT) -> None:
         self.sandbox_dir = Path(sandbox_dir).resolve()
         self.project_root = Path(project_root).resolve()
-        self._processor: Optional[Any] = None
-        self._vlm: Optional[QwenVisionRuntime] = None
-
-    @property
-    def vlm(self) -> QwenVisionRuntime:
-        if self._vlm is None:
-            self._vlm = QwenVisionRuntime(
-                self.project_root / "models" / "vision" / "qwen2.5-vl-3b-instruct"
-            )
-        return self._vlm
+        # Keep OCR-only and VLM-enabled processors separate.  In particular, the
+        # Member 3 default vision backend is a deterministic test double and must
+        # never be selected by this production tool.
+        self._processors: Dict[bool, Any] = {}
 
     @property
     def processor(self) -> Any:
-        if self._processor is None:
+        """Backward-compatible OCR-only processor accessor.
+
+        Callers that want VLM processing must use ``inspect(..., use_vlm=True)``;
+        this prevents OCR-only requests from manufacturing mock vision findings.
+        """
+        return self._get_processor(enable_vision=False)
+
+    def _get_processor(self, *, enable_vision: bool) -> Any:
+        if enable_vision not in self._processors:
             try:
                 from member3_ocr.core.multimodal_processor import (
                     MultimodalProcessor,
@@ -1087,11 +1701,12 @@ class VisionInspectorTool:
                     PaddleOCRBackend,
                     OCRPipeline,
                 )
+                from member3_ocr.core.vision_pipeline import create_vision_pipeline
 
                 config = MultimodalProcessorConfig(
                     enable_document_parsing=True,
                     enable_ocr=True,
-                    enable_vision=True,
+                    enable_vision=enable_vision,
                     enable_drawing_analysis=True,
                 )
 
@@ -1125,14 +1740,25 @@ class VisionInspectorTool:
                         "detection and recognition model directories."
                     )
 
-                if ocr_pipeline is not None:
-                    self._processor = MultimodalProcessor(config=config, ocr_pipeline=ocr_pipeline)
-                else:
-                    self._processor = MultimodalProcessor(config=config)
+                vision_pipeline = None
+                if enable_vision:
+                    # This is the sole production VLM path.  It creates a
+                    # structured VisionResult which the drawing/inspection
+                    # routes consume directly; no standalone Qwen call follows.
+                    vision_pipeline = create_vision_pipeline(
+                        model_path=self.project_root / "models" / "vision" / "qwen2.5-vl-3b-instruct",
+                        device=os.environ.get("AGENT_VISION_DEVICE", "auto"),
+                    )
+
+                self._processors[enable_vision] = MultimodalProcessor(
+                    config=config,
+                    ocr_pipeline=ocr_pipeline,
+                    vision_pipeline=vision_pipeline,
+                )
             except Exception as e:
                 logger.error(f"Failed to initialize MultimodalProcessor: {e}")
                 raise
-        return self._processor
+        return self._processors[enable_vision]
 
     def _resolve_input_path(self, file_path: Union[str, Path]) -> Path:
         """Resolve an input file path safely against sandbox or project directories."""
@@ -1184,7 +1810,7 @@ class VisionInspectorTool:
 
         from member3_ocr.core.multimodal_processor import export_for_agent
 
-        result = self.processor.orchestrate(
+        result = self._get_processor(enable_vision=use_vlm).orchestrate(
             source=target_path,
             force_route=force_route,
             document_category=document_category,
@@ -1214,22 +1840,151 @@ class VisionInspectorTool:
             "has_drawing": result.has_drawing,
             "has_vision_analysis": result.has_vision_analysis,
             "summary": summary,
+            "vision_status": result.processing_metadata.get("vision", {}),
             "execution_time_ms": elapsed_ms,
         }
         if use_vlm:
-            try:
-                payload["vlm"] = self.vlm.answer(
-                    target_path,
-                    question or "Analyze this industrial image. Report only visible, verifiable details.",
-                )
-            except LocalVisionUnavailable as exc:
-                # OCR evidence is retained, but is never represented as a VLM answer.
-                payload["vlm"] = {"status": "capability_unavailable", "error": str(exc)}
-                payload["status"] = "capability_unavailable"
+            # ``question`` is intentionally not a second ad-hoc VLM call.  The
+            # structured VisionResult is the authoritative reusable result.
+            vision_status = payload["vision_status"]
+            payload["vlm"] = {
+                "status": "success" if vision_status.get("success") else "error",
+                "answer": (
+                    result.vision_analysis.caption if result.vision_analysis is not None
+                    else "Structured drawing VLM result fused into drawing_analysis."
+                    if result.drawing_analysis is not None and vision_status.get("success")
+                    else ""
+                ),
+                **vision_status,
+            }
+            if not vision_status.get("success"):
+                payload["status"] = "warning"
         return payload
 
 
-# ── 7. Master Tool Executor ────────────────────────────────────────────────
+# ── 10. Local Stable Diffusion Image Generator Tool ────────────────────────
+
+class ImageGeneratorTool:
+    """Tool wrapper for local Stable Diffusion text-to-image generation.
+
+    Integrates DiffusionImageGenerator with the agent sandbox and backend
+    artifact staging infrastructure while strictly maintaining offline operation
+    and memory hygiene.
+    """
+
+    def __init__(
+        self,
+        sandbox_dir: Path,
+        project_root: Path = DEFAULT_PROJECT_ROOT,
+        generator: Optional[Any] = None,
+    ) -> None:
+        self.sandbox_dir = Path(sandbox_dir).resolve()
+        self.project_root = Path(project_root).resolve()
+        self._generator = generator
+
+    @property
+    def generator(self) -> Any:
+        """Lazily instantiate DiffusionImageGenerator."""
+        if self._generator is None:
+            from rag_engine.vision.image_generator import DiffusionImageGenerator
+            self._generator = DiffusionImageGenerator(
+                default_output_dir=self.sandbox_dir
+            )
+        return self._generator
+
+    def is_available(self) -> bool:
+        """Check whether local diffusion model weights exist on disk."""
+        try:
+            return bool(self.generator.is_available())
+        except Exception:
+            return False
+
+    def generate(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        width: int = 512,
+        height: int = 512,
+        steps: int = 30,
+        guidance_scale: float = 7.5,
+        seed: Optional[int] = None,
+        filename: Optional[str] = None,
+        filename_prefix: Optional[str] = None,
+        unload_after: bool = True,
+    ) -> Dict[str, Any]:
+        """Generate an image via DiffusionImageGenerator, stage the artifact, and return structured output."""
+        gen = self.generator
+        try:
+            result = gen.generate(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+                output_dir=self.sandbox_dir,
+                filename=filename,
+                filename_prefix=filename_prefix,
+            )
+        finally:
+            if unload_after and hasattr(self._generator, "unload"):
+                try:
+                    self._generator.unload()
+                except Exception as unload_exc:
+                    logger.debug("Diffusion pipeline unload skipped or failed: %s", unload_exc)
+
+        if not getattr(result, "success", False):
+            err_str = str(getattr(result, "error", "") or "")
+            is_cap = (
+                "DiffusionCapabilityUnavailable" in err_str
+                or "capability unavailable" in err_str.lower()
+                or "not found" in err_str.lower()
+                or "missing" in err_str.lower()
+                or (hasattr(gen, "is_available") and not gen.is_available())
+            )
+            return {
+                "status": "capability_unavailable" if is_cap else "error",
+                "success": False,
+                "error": result.error if hasattr(result, "error") else "Image generation failed.",
+                "prompt": prompt,
+                "model": getattr(result, "model_name", "stable-diffusion-v1-5"),
+                "model_name": getattr(result, "model_name", "stable-diffusion-v1-5"),
+                "device": getattr(result, "device", "unknown"),
+                "generation_time_seconds": getattr(result, "generation_time_seconds", 0.0),
+                "seed": seed,
+            }
+
+        safe_path = Path(result.image_path).resolve()
+        staged_path = stage_artifact_for_backend(safe_path)
+
+        return {
+            "status": "success",
+            "success": True,
+            "filename": safe_path.name,
+            "path": str(safe_path),
+            "image_path": str(safe_path),
+            "file_size_bytes": safe_path.stat().st_size if safe_path.is_file() else 0,
+            "staged_path": str(staged_path) if staged_path else None,
+            "staged_reference": staged_path.name if staged_path else None,
+            "dimensions": {"width": result.width, "height": result.height},
+            "width": result.width,
+            "height": result.height,
+            "steps": result.steps,
+            "guidance_scale": result.guidance_scale,
+            "seed": result.seed,
+            "model": result.model_name,
+            "model_name": result.model_name,
+            "device": result.device,
+            "generation_time_seconds": result.generation_time_seconds,
+            "peak_vram_mb": result.peak_vram_mb,
+            "prompt": result.prompt,
+            "negative_prompt": result.negative_prompt,
+            "metadata": result.metadata if hasattr(result, "metadata") and result.metadata else {},
+        }
+
+
+# ── 11. Master Tool Executor ───────────────────────────────────────────────
 
 class ToolExecutor:
     """Master Tool Orchestrator for the Sovereign AI Agent.
@@ -1240,7 +1995,8 @@ class ToolExecutor:
       3. Handle 'Insufficient Evidence' as a first-class valid return type.
       4. Pass RAG context directly into deterministic tools (e.g. calculator).
       5. Provide multimodal OCR & vision inspection via VisionInspectorTool.
-      6. Log every invocation into an append-only JSONL audit file.
+      6. Provide offline local Stable Diffusion image generation via ImageGeneratorTool.
+      7. Log every invocation into an append-only JSONL audit file.
     """
 
     def __init__(
@@ -1248,6 +2004,7 @@ class ToolExecutor:
         rag_pipeline: Optional[RAGPipeline] = None,
         sandbox_dir: Union[str, Path] = DEFAULT_SANDBOX_DIR,
         audit_log_path: Optional[Union[str, Path]] = None,
+        image_generator: Optional[Any] = None,
     ) -> None:
         self._rag_pipeline = rag_pipeline
         self._rag_pipelines: Dict[str, RAGPipeline] = {}
@@ -1264,8 +2021,10 @@ class ToolExecutor:
         self.document_generator = DocumentGenerator(self.file_manager)
         self.spreadsheet_generator = SpreadsheetGenerator(self.file_manager)
         self.presentation_generator = PresentationGenerator(self.file_manager)
-        self.pdf_converter = PDFConverter(self.file_manager)
+        self.pdf_generator = NativePDFGenerator(self.file_manager)
+        self.pdf_converter = PDFConverter(self.file_manager, native_generator=self.pdf_generator)
         self.vision_tool = VisionInspectorTool(self.sandbox_dir, DEFAULT_PROJECT_ROOT)
+        self.image_tool = ImageGeneratorTool(self.sandbox_dir, DEFAULT_PROJECT_ROOT, generator=image_generator)
 
     def tool_contracts(self) -> Dict[str, Dict[str, Any]]:
         """Serializable tool schemas for a future backend capability endpoint."""
@@ -1373,6 +2132,9 @@ class ToolExecutor:
                     else 0.0
                 ),
                 "total_latency_ms": round(resp.total_latency_ms or elapsed_ms, 2),
+                # Internal-only canonical payload for downstream artifact tools.
+                # It is deliberately not derived from answer prose.
+                "structured_report": resp.structured_report,
             }
 
             self.audit_logger.log(
@@ -1458,6 +2220,42 @@ class ToolExecutor:
             raise
 
     # ------------------------------------------------------------------
+    # Tool 3: Local Stable Diffusion Image Generator
+    # ------------------------------------------------------------------
+
+    @property
+    def image_generator(self) -> Any:
+        """Lazily instantiated local Stable Diffusion image generator."""
+        return self.image_tool.generator
+
+    def generate_image(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        width: int = 512,
+        height: int = 512,
+        steps: int = 30,
+        guidance_scale: float = 7.5,
+        seed: Optional[int] = None,
+        filename: Optional[str] = None,
+        filename_prefix: Optional[str] = None,
+        unload_after: bool = True,
+    ) -> Dict[str, Any]:
+        """Generate an image using the local Stable Diffusion image generator."""
+        return self.image_tool.generate(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            filename=filename,
+            filename_prefix=filename_prefix,
+            unload_after=unload_after,
+        )
+
+    # ------------------------------------------------------------------
     # Master Execution Entrance: execute() consuming RoutingDecision
     # ------------------------------------------------------------------
 
@@ -1533,15 +2331,54 @@ class ToolExecutor:
                     model_name=routed_model_name,
                 )
 
+        # Artifact tools consume the canonical report produced by the evidence
+        # gate.  This prevents a planner or renderer from using LLM prose as a
+        # second, unvalidated factual source.
+        if tool_name in {"document_generator", "xlsx_generator", "pptx_generator", "pdf_generator"}:
+            report = kwargs.get("structured_report") or (rag_context or {}).get("structured_report")
+            if use_rag_context and report is None:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                return ToolResult(
+                    tool_name=tool_name,
+                    status="insufficient_evidence",
+                    output=None,
+                    rag_context=rag_context,
+                    is_verified=False,
+                    execution_time_ms=elapsed_ms,
+                    error="Artifact generation requires a validated structured evidence report.",
+                )
+            if report is not None:
+                is_valid, validation_errors = report.validate()
+                if not is_valid:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    return ToolResult(
+                        tool_name=tool_name,
+                        status="insufficient_evidence",
+                        output=None,
+                        rag_context=rag_context,
+                        is_verified=False,
+                        execution_time_ms=elapsed_ms,
+                        error=f"StructuredReport failed grounding validation: {', '.join(validation_errors)}",
+                    )
+                kwargs.update(report.renderer_payload())
+
         # ── Step 2: Route to Designated Tool ──────────────────────────
         try:
             if tool_name == "xlsx_generator":
                 try:
                     wb_spec    = kwargs.get("workbook")
                     xls_fname  = kwargs.get("filename", "report.xlsx")
+                    if not xls_fname.lower().endswith(".xlsx"):
+                        xls_fname = f"{xls_fname}.xlsx"
                     xls_meta   = kwargs.get("metadata")
                     xls_out    = self.spreadsheet_generator.generate(
-                        workbook=wb_spec, filename=xls_fname, metadata=xls_meta
+                        workbook=wb_spec,
+                        filename=xls_fname,
+                        metadata=xls_meta,
+                        title=kwargs.get("title", "Engineering & Compliance Data"),
+                        sections=kwargs.get("sections"),
+                        citations=kwargs.get("citations"),
+                        summary=kwargs.get("summary"),
                     )
                     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                     self.audit_logger.log(
@@ -1583,10 +2420,18 @@ class ToolExecutor:
                     pptx_title  = kwargs.get("title", "Engineering Report")
                     pptx_slides = kwargs.get("slides")
                     pptx_fname  = kwargs.get("filename", "report.pptx")
+                    if not pptx_fname.lower().endswith(".pptx"):
+                        pptx_fname = f"{pptx_fname}.pptx"
                     pptx_meta   = kwargs.get("metadata")
                     pptx_out    = self.presentation_generator.generate(
-                        title=pptx_title, slides=pptx_slides,
-                        filename=pptx_fname, metadata=pptx_meta
+                        title=pptx_title,
+                        slides=pptx_slides,
+                        filename=pptx_fname,
+                        metadata=pptx_meta,
+                        summary=kwargs.get("summary"),
+                        sections=kwargs.get("sections"),
+                        citations=kwargs.get("citations"),
+                        conclusion=kwargs.get("conclusion"),
                     )
                     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                     self.audit_logger.log(
@@ -1625,18 +2470,38 @@ class ToolExecutor:
 
             if tool_name == "pdf_generator":
                 try:
-                    pdf_docx   = kwargs.get("docx_filename") or kwargs.get("filename", "report.docx")
-                    pdf_out_fn = kwargs.get("out_filename")
-                    pdf_out    = self.pdf_converter.convert(
-                        docx_filename=pdf_docx, out_filename=pdf_out_fn
-                    )
+                    pdf_filename = kwargs.get("filename") or kwargs.get("out_filename") or "report.pdf"
+                    if not pdf_filename.lower().endswith(".pdf"):
+                        pdf_filename = f"{pdf_filename}.pdf"
+
+                    docx_input = kwargs.get("docx_filename")
+                    sections = kwargs.get("sections")
+                    title = kwargs.get("title") or "Engineering & Compliance Report"
+
+                    # If structured sections or title are provided, use NativePDFGenerator
+                    if sections is not None or not docx_input:
+                        pdf_out = self.pdf_generator.generate(
+                            title=title,
+                            sections=sections or [],
+                            filename=pdf_filename,
+                            metadata=kwargs.get("metadata"),
+                            citations=kwargs.get("citations"),
+                            summary=kwargs.get("summary"),
+                            conclusion=kwargs.get("conclusion"),
+                        )
+                    else:
+                        # Convert docx input
+                        pdf_out = self.pdf_converter.convert(
+                            docx_filename=docx_input, out_filename=pdf_filename
+                        )
+
                     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                     self.audit_logger.log(
                         tool_name="pdf_generator",
-                        arguments={"docx_filename": pdf_docx, "out_filename": pdf_out_fn},
+                        arguments={"filename": pdf_filename, "title": title},
                         execution_time_ms=elapsed_ms,
                         status="success",
-                        result_summary=f"PDF saved {pdf_out['filename']} via {pdf_out['converter']} ({pdf_out['file_size_bytes']} bytes)",
+                        result_summary=f"PDF saved {pdf_out['filename']} via {pdf_out.get('generator', pdf_out.get('converter', 'reportlab'))} ({pdf_out['file_size_bytes']} bytes)",
                     )
                     return ToolResult(
                         tool_name="pdf_generator",
@@ -1649,17 +2514,16 @@ class ToolExecutor:
                 except Exception as exc:
                     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                     err_msg = str(exc)
-                    is_unavail = "Neither was found" in err_msg or "PDF conversion requires" in err_msg
                     self.audit_logger.log(
                         tool_name="pdf_generator",
-                        arguments={"docx_filename": kwargs.get("docx_filename", "")},
+                        arguments={"filename": kwargs.get("filename", "")},
                         execution_time_ms=elapsed_ms,
-                        status="capability_unavailable" if is_unavail else "error",
+                        status="error",
                         result_summary=f"pdf_generator: {err_msg[:200]}",
                     )
                     return ToolResult(
                         tool_name="pdf_generator",
-                        status="capability_unavailable" if is_unavail else "error",
+                        status="error",
                         output=None,
                         rag_context=rag_context,
                         execution_time_ms=elapsed_ms,
@@ -1797,6 +2661,8 @@ class ToolExecutor:
                 title_text = kwargs.get("title", "Refinery Report")
                 sections_list = kwargs.get("sections", [])
                 doc_filename = kwargs.get("filename", "report.docx")
+                if not doc_filename.lower().endswith(".docx"):
+                    doc_filename = f"{doc_filename}.docx"
                 meta = kwargs.get("metadata")
                 try:
                     doc_out = self.document_generator.generate_report(
@@ -1804,6 +2670,9 @@ class ToolExecutor:
                         sections=sections_list,
                         filename=doc_filename,
                         metadata=meta,
+                        summary=kwargs.get("summary"),
+                        citations=kwargs.get("citations"),
+                        conclusion=kwargs.get("conclusion"),
                     )
                     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                     self.audit_logger.log(
@@ -1889,6 +2758,93 @@ class ToolExecutor:
                     return ToolResult(
                         tool_name="vision_inspector",
                         status="error",
+                        output=None,
+                        rag_context=rag_context,
+                        is_verified=False,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=str(exc),
+                    )
+
+            elif tool_name in ("image_generator", "image_generation", "generate_image"):
+                from agent.router import extract_image_generation_params
+                task_str = task if (task and task.strip()) else kwargs.get("prompt", "")
+                extracted = extract_image_generation_params(task_str, **kwargs) if task_str else {}
+
+                prompt = kwargs.get("prompt") or extracted.get("prompt") or task_str
+                neg_prompt = kwargs.get("negative_prompt") or extracted.get("negative_prompt")
+                width = kwargs.get("width") or extracted.get("width", 512)
+                height = kwargs.get("height") or extracted.get("height", 512)
+                steps = kwargs.get("steps") or extracted.get("steps", 30)
+                guidance_scale = kwargs.get("guidance_scale") or extracted.get("guidance_scale", 7.5)
+                seed = kwargs.get("seed") if kwargs.get("seed") is not None else extracted.get("seed")
+                filename = kwargs.get("filename") or extracted.get("filename")
+                filename_prefix = kwargs.get("filename_prefix") or kwargs.get("prefix") or extracted.get("filename_prefix")
+                unload_after = kwargs.get("unload_after", True)
+
+                try:
+                    img_out = self.image_tool.generate(
+                        prompt=prompt,
+                        negative_prompt=neg_prompt,
+                        width=width,
+                        height=height,
+                        steps=steps,
+                        guidance_scale=guidance_scale,
+                        seed=seed,
+                        filename=filename,
+                        filename_prefix=filename_prefix,
+                        unload_after=unload_after,
+                    )
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    status = img_out.get("status", "success")
+                    is_ok = status == "success"
+
+                    self.audit_logger.log(
+                        tool_name="image_generator",
+                        arguments={"prompt": str(prompt)[:100], "seed": seed, "filename": filename},
+                        execution_time_ms=elapsed_ms,
+                        status=status,
+                        result_summary=(
+                            f"Generated {img_out.get('filename')} ({img_out.get('width')}x{img_out.get('height')}, {img_out.get('generation_time_seconds', 0):.2f}s)"
+                            if is_ok
+                            else f"image_generator {status}: {img_out.get('error')}"
+                        ),
+                    )
+
+                    return ToolResult(
+                        tool_name="image_generator",
+                        status=status,
+                        output=img_out if is_ok else None,
+                        rag_context=rag_context,
+                        is_verified=is_ok,
+                        execution_time_ms=elapsed_ms,
+                        fallback_warning=fallback_warning,
+                        error=img_out.get("error") if not is_ok else None,
+                        metadata={
+                            k: v for k, v in img_out.items()
+                            if k in (
+                                "filename", "path", "image_path", "staged_path",
+                                "staged_reference", "dimensions", "width", "height", "steps",
+                                "guidance_scale", "seed", "model", "model_name",
+                                "device", "generation_time_seconds", "peak_vram_mb"
+                            )
+                        } if is_ok else {},
+                    )
+                except Exception as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+                    from rag_engine.vision.image_generator import DiffusionCapabilityUnavailable
+                    is_cap = isinstance(exc, DiffusionCapabilityUnavailable)
+                    status = "capability_unavailable" if is_cap else "error"
+                    self.audit_logger.log(
+                        tool_name="image_generator",
+                        arguments={"prompt": str(prompt)[:100]},
+                        execution_time_ms=elapsed_ms,
+                        status=status,
+                        result_summary=f"image_generator exception: {exc}",
+                    )
+                    return ToolResult(
+                        tool_name="image_generator",
+                        status=status,
                         output=None,
                         rag_context=rag_context,
                         is_verified=False,

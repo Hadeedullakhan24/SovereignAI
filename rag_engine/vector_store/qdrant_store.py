@@ -42,6 +42,7 @@ from rag_engine.vector_store.exceptions import (
     CollectionNotFoundError,
     SnapshotError,
     VectorStoreError,
+    VectorDimensionMismatchError,
 )
 from rag_engine.vector_store.metadata_serializer import MetadataSerializer
 from rag_engine.vector_store.vector_utils import (
@@ -223,6 +224,62 @@ class QdrantVectorStore(BaseVectorStore):
             except Exception as e:
                 logger.error("Error checking collection existence '%s': %s", name, e)
                 return False
+
+    def get_collection_vector_size(self, name: str) -> int:
+        """Return a collection's single-vector dimension without altering it."""
+        client = self._ensure_client()
+        if not self.collection_exists(name):
+            raise CollectionNotFoundError(f"Collection '{name}' does not exist.")
+        try:
+            vectors = client.get_collection(collection_name=name).config.params.vectors
+            if hasattr(vectors, "size"):
+                return int(vectors.size)
+            if isinstance(vectors, dict) and len(vectors) == 1:
+                return next(iter(vectors.values())).size
+        except Exception as exc:
+            raise VectorStoreError(f"Could not determine vector size for '{name}': {exc}") from exc
+        raise VectorStoreError(f"Collection '{name}' does not have a single unnamed vector configuration.")
+
+    def ensure_collection(self, config: CollectionConfig) -> bool:
+        """Create a collection once, or non-destructively validate its dimension.
+
+        Returns ``True`` when created and ``False`` when a compatible collection
+        already existed.  It intentionally never recreates or deletes data.
+        """
+        if not self.collection_exists(config.name):
+            return self.create_collection(config)
+        actual_size = self.get_collection_vector_size(config.name)
+        if actual_size != config.vector_size:
+            raise VectorDimensionMismatchError(
+                f"Collection '{config.name}' has vector size {actual_size}; expected {config.vector_size}. "
+                "Refusing to recreate an existing collection."
+            )
+        return False
+
+    def upsert_vision_points(
+        self,
+        collection_name: str,
+        points: list[tuple[str, list[float], dict[str, Any]]],
+    ) -> int:
+        """Upsert dedicated vision payloads through this existing Qdrant client."""
+        if not points:
+            return 0
+        client = self._ensure_client()
+        expected_size = self.get_collection_vector_size(collection_name)
+        qdrant_points: list[Any] = []
+        for point_id, vector, payload in points:
+            if len(vector) != expected_size:
+                raise VectorDimensionMismatchError(
+                    f"Vision point '{point_id}' has dimension {len(vector)}; collection expects {expected_size}."
+                )
+            qdrant_points.append(models.PointStruct(
+                id=chunk_id_to_uuid(point_id), vector=vector, payload=payload,
+            ))
+        try:
+            client.upsert(collection_name=collection_name, points=qdrant_points, wait=True)
+        except Exception as exc:
+            raise VectorStoreError(f"Vision upsert failed on collection '{collection_name}': {exc}") from exc
+        return len(qdrant_points)
 
     def delete_collection(self, name: str) -> bool:
         """Delete a collection."""

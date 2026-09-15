@@ -1,0 +1,4 @@
+# Python 3.13 binary compatibility constraint.  The project runtime uses
+# python-docx/python-pptx, both of which import lxml.etree at startup.
+# Do not use a wheel tagged for another CPython ABI.
+lxml==5.3.2

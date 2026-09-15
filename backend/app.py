@@ -298,7 +298,22 @@ def artifact(
     user: str = Depends(current_user),
 ) -> FileResponse:
     target = ARTIFACT_DIR / _safe_name(filename)
+
+    if not target.is_file():
+        sandbox_target = Path(__file__).resolve().parents[1] / "workspace_sandbox" / target.name
+        if sandbox_target.is_file():
+            ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sandbox_target, target)
+
     if not target.is_file():
         raise HTTPException(status_code=404, detail="Artifact not found")
+
     _audit(user, "download", target.name)
-    return FileResponse(target, filename=target.name)
+
+    media_type = "application/pdf" if target.suffix.lower() == ".pdf" else None
+
+    return FileResponse(
+        target,
+        filename=target.name,
+        media_type=media_type,
+    )

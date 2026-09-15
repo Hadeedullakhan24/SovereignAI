@@ -8,7 +8,7 @@ section titles, equipment tags, and verbatim source quotes.
 from __future__ import annotations
 
 import re
-from typing import Sequence
+from typing import Any, Sequence
 
 from rag_engine.retrieval.base_retriever import CitationBundle
 
@@ -80,10 +80,9 @@ class ResponseFormatter:
             selected = selected[:max_sources]
 
         lines: list[str] = ["### Sources"]
-        for idx, bundle in enumerate(selected, start=1):
-            anchor = getattr(bundle, "citation_id", f"[{idx}]")
-            if not anchor.startswith("["):
-                anchor = f"[{anchor}]"
+        seen_entries: set[tuple[str, Any]] = set()
+        count = 1
+        for bundle in selected:
             raw_doc = getattr(bundle, "document_name", None) or getattr(bundle, "document_id", "Document")
 
             # Clean document title
@@ -94,7 +93,19 @@ class ResponseFormatter:
                 clean_doc = clean_doc.title()
 
             page = bundle.page_number if getattr(bundle, "page_number", None) else 1
+            key = (clean_doc.casefold(), page)
+            if key in seen_entries:
+                continue
+            seen_entries.add(key)
+
+            anchor = f"[{count}]"
+            count += 1
             lines.append(f"{anchor} {clean_doc} — Page {page}")
+            if count > max_sources:
+                break
+
+        if len(lines) == 1:
+            return ""
 
         return "\n".join(lines)
 
@@ -109,6 +120,35 @@ class ResponseFormatter:
         return cleaned.strip()
 
     @staticmethod
+    def deduplicate_lines_and_blocks(text: str) -> str:
+        """Deduplicate repeated lines and repeating block loops from generated response."""
+        if not text:
+            return ""
+
+        lines = text.split("\n")
+        deduped_lines: list[str] = []
+        seen_line_hashes: set[str] = set()
+
+        for line in lines:
+            stripped = line.strip()
+            # If empty line or short heading, allow it
+            if not stripped or len(stripped) < 15 or stripped.startswith("#"):
+                deduped_lines.append(line)
+                continue
+
+            # Normalized line content for hash deduplication
+            norm = re.sub(r"\s+", " ", stripped.lower().lstrip("-*• 0123456789.)]"))
+            if len(norm) > 15:
+                if norm in seen_line_hashes:
+                    # Duplicate line detected, skip
+                    continue
+                seen_line_hashes.add(norm)
+
+            deduped_lines.append(line)
+
+        return "\n".join(deduped_lines)
+
+    @staticmethod
     def format_with_provenance(
         answer_text: str,
         citations: Sequence[CitationBundle],
@@ -116,6 +156,7 @@ class ResponseFormatter:
     ) -> str:
         """Append a clean bibliographic references section to generated text."""
         cleaned_answer = ResponseFormatter.strip_provenance(answer_text)
+        cleaned_answer = ResponseFormatter.deduplicate_lines_and_blocks(cleaned_answer)
         if not citations:
             return cleaned_answer
 
@@ -123,6 +164,10 @@ class ResponseFormatter:
 
         for idx, bundle in enumerate(citations, start=1):
             anchor = getattr(bundle, "citation_id", f"[{idx}]")
+            if not anchor.startswith("[") and not anchor.isdigit():
+                anchor = f"[{idx}]"
+            elif not anchor.startswith("["):
+                anchor = f"[{anchor}]"
             doc = getattr(bundle, "document_name", None) or getattr(bundle, "document_id", "Document")
             page = f"Page {bundle.page_number}" if bundle.page_number else "Page N/A"
             section = f"Section: {bundle.section_title}" if bundle.section_title else ""

@@ -91,23 +91,34 @@ class PromptBuilder(BasePromptBuilder):
         query_text = f"\n=== USER QUERY ===\n{query.strip()}\n"
         query_tokens = self.budget_manager.estimate_tokens(query_text)
 
-        if arch_enum == PromptArchetype.EMAIL:
+        from rag_engine.generation.prompt.task_intent import (
+            EmailPurpose,
+            OutputFormat,
+            TaskIntentClassifier,
+        )
+
+        intent = TaskIntentClassifier.classify(query)
+        directive_text = intent.get_directive_instructions()
+
+        if arch_enum == PromptArchetype.EMAIL or intent.output_format == OutputFormat.EMAIL:
+            salutation_target = intent.recipient or "Team"
             instruction_text = (
                 f"\n=== INSTRUCTIONS FOR EMAIL DRAFTING ===\n"
-                f"{template.generation_instruction}\n"
+                f"{template.generation_instruction}\n\n"
+                f"{directive_text}\n\n"
                 "MANDATORY EMAIL CONSTRAINTS:\n"
-                "- Write a complete, polished email with 'Subject:', salutation ('Dear [Recipient/Team],'), structured body, and sign-off ('Best regards,').\n"
+                f"- Salutation: Dear {salutation_target},\n"
+                "- Write a complete, polished email with 'Subject:', salutation, structured body, and sign-off ('Best regards,').\n"
                 "- Do NOT include inline bracket citations like [1] or [2] inside the email text. State the verified facts naturally.\n"
                 "- Do NOT insert a References or Sources section inside the email.\n"
-                "- Preserve exact status: If the source documents state an action is proposed or required, draft the email to communicate or request approval for the PROPOSED scope.\n"
-                "- If the user asks to state maintenance was completed but the documents do not confirm completion, state clearly in the email/notice that completion is not confirmed by records.\n"
                 "- Do NOT claim files are attached.\n\n"
                 "ASSISTANT: "
             )
         else:
             instruction_text = (
                 f"\n=== INSTRUCTIONS FOR RESPONSE ===\n"
-                f"{template.generation_instruction}\n"
+                f"{template.generation_instruction}\n\n"
+                f"{directive_text}\n\n"
                 "MANDATORY CONSTRAINTS:\n"
                 "- DIRECT ANSWER FIRST: Directly answer what the user query asks in the first sentence. Use inline bracket citations [n] for every factual assertion.\n"
                 "- STATUS PRESERVATION: Preserve exact status designations (required, proposed, recommended, approved, scheduled, planned, open, vs completed). Never claim an action was completed or carried out unless the evidence explicitly states completion.\n"

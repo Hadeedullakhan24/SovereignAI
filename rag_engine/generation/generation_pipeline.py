@@ -74,7 +74,7 @@ class GenerationResponse:
     query: str
     answer: str
     raw_answer: str
-    prompt_payload: PromptPayload
+    prompt_payload: Optional[PromptPayload]
     citations: list[CitationBundle]
     citation_report: CitationValidationReport
     grounding_report: GroundingVerificationReport
@@ -177,6 +177,21 @@ class GenerationPipeline:
         if self.cache is not None and self.config.cache_enabled:
             cached = self.cache.get(cache_key)
             if cached is not None:
+                # A cache entry is not evidence.  Revalidate it against the
+                # current selected context; indexes and source versions can
+                # change between requests.
+                cached_citation_report = self.citation_validator.validate(
+                    generated_text=cached.response_text,
+                    valid_anchors=prompt_payload.chunk_to_anchor_map,
+                    valid_sources=[c.document_id for c in retrieval_result.citations],
+                    citation_context=retrieval_result.citations,
+                )
+                cached_grounding = self.hallucination_guard.verify(
+                    cached_citation_report.cleaned_text, retrieval_result.formatted_context
+                )
+                if not (cached_citation_report.is_valid and cached_grounding.is_grounded):
+                    cached = None
+            if cached is not None:
                 self.event_bus.publish(
                     GenerationEvent(
                         event_type=GenerationEventType.CACHE_HIT,
@@ -208,13 +223,8 @@ class GenerationPipeline:
                     citation_precision=1.0,
                     is_valid=True,
                 )
-                ground_report = GroundingVerificationReport(
-                    grounding_score=1.0,
-                    verified_entities=[],
-                    unverified_entities=[],
-                    is_grounded=True,
-                )
-                conf = self.confidence_scorer.calculate(1.0, 1.0, 1.0)
+                ground_report = cached_grounding
+                conf = self.confidence_scorer.calculate(1.0, 1.0, ground_report.grounding_score)
 
                 return GenerationResponse(
                     session_id=session_id,
@@ -293,6 +303,10 @@ class GenerationPipeline:
 
         # 10. Format Response with Provenance References
         clean_ans = alignment_report.cleaned_text
+        # A response that fails either grounding or answer/evidence alignment
+        # is never formatted as a trustworthy answer or turned into an artifact.
+        if not ground_report.is_grounded or not alignment_report.is_question_aligned:
+            clean_ans = "Not documented in the available evidence."
         final_answer = ResponseFormatter.format_with_provenance(
             answer_text=clean_ans,
             citations=retrieval_result.citations,

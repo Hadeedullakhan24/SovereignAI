@@ -90,6 +90,12 @@ class ModelRecord:
                 self._installed = True
                 return True
 
+        # Diffusion model check (e.g. Stable Diffusion)
+        if (self.local_path / "model_index.json").exists() and (self.local_path / "unet").exists():
+            if self.role in ("image_generation", "diffusion") or "image_generation" in self.capabilities or self.family == "stable_diffusion":
+                self._installed = True
+                return True
+
         config_ok = (self.local_path / "config.json").exists()
         weights = (
             list(self.local_path.glob("*.safetensors"))
