@@ -93,6 +93,11 @@ def audit(user: str=Depends(current_user)) -> list[dict[str,Any]]:
     return [dict(r) for r in rows]
 @app.get("/artifacts/{filename}")
 def artifact(filename: str,user: str=Depends(current_user)) -> FileResponse:
-    target=ARTIFACT_DIR/_safe_name(filename)
+    name=_safe_name(filename); target=ARTIFACT_DIR/name
+    if not target.is_file():
+        sandbox_target=Path(__file__).resolve().parents[1]/"workspace_sandbox"/name
+        if sandbox_target.is_file():
+            ARTIFACT_DIR.mkdir(parents=True,exist_ok=True); shutil.copy2(sandbox_target,target)
     if not target.is_file(): raise HTTPException(404,"Artifact not found")
-    _audit(user,"download",target.name); return FileResponse(target,filename=target.name)
+    _audit(user,"download",target.name); media_type="application/pdf" if target.suffix.lower()==".pdf" else None
+    return FileResponse(target,filename=target.name,media_type=media_type)

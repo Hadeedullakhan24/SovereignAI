@@ -1,0 +1,122 @@
+{
+  "goal": "Analyze this image C:\\Users\\hp\\AppData\\Local\\Temp\\pytest-of-hp\\pytest-348\\test_agent_handle_preserves_vi0\\sample_inspection.jpg",
+  "status": "REQUIRES_HUMAN_REVIEW",
+  "steps": [
+    {
+      "step_number": 1,
+      "name": "Read inspection report",
+      "step_type": "automated",
+      "thought": "I need to read the statutory inspection report 'pressure_vessel_inspection_002.md' from the project sandbox to examine physical condition, thickness survey data, and equipment metadata.",
+      "action": "file_manager(action='read', filename='pressure_vessel_inspection_002.md')",
+      "action_input": {
+        "action": "read",
+        "filename": "pressure_vessel_inspection_002.md"
+      },
+      "observation": "Successfully loaded 'pressure_vessel_inspection_002.md' (0 chars, 0 lines).",
+      "tool_result": {
+        "tool_name": "vision_inspector",
+        "status": "success",
+        "is_verified": true,
+        "output": {
+          "text": "Inspection verified",
+          "routing_decision": "inspection_report"
+        },
+        "rag_context": null,
+        "execution_time_ms": 0.0,
+        "fallback_warning": null,
+        "error": null
+      },
+      "status": "completed",
+      "is_verified": true,
+      "reasoning_trace": "",
+      "execution_time_ms": 0.08
+    },
+    {
+      "step_number": 2,
+      "name": "Extract findings",
+      "step_type": "automated",
+      "thought": "I need to parse the raw inspection text to extract structural parameters: Equipment Tag, Design Pressure, Design Temperature, Shell & Head thicknesses, and inspector recommendations.  Any field not found in the document will be flagged rather than silently substituted.",
+      "action": "extract_inspection_parameters(text=raw_report_text)",
+      "action_input": {
+        "target_equipment": "UNKNOWN"
+      },
+      "observation": "EXTRACTION INCOMPLETE — critical fields could not be read from source document: equipment_id, design_pressure_kg_cm2, shell_min_thickness_mm. Extracted: none. Defaulted/missing: equipment_id, report_no, design_pressure_kg_cm2, design_temp_c, shell_min_thickness_mm, head_thickness_mm. Fabricated defaults would produce unverified engineering conclusions — halting.",
+      "tool_result": {
+        "tool_name": "extract_findings",
+        "status": "requires_verification",
+        "is_verified": false,
+        "output": {
+          "equipment_id": "UNKNOWN",
+          "equipment_name": "UNKNOWN",
+          "report_no": "UNKNOWN",
+          "design_pressure_kg_cm2": null,
+          "design_pressure_unit": "kg/cm2g",
+          "design_temp_c": null,
+          "shell_orig_thickness_mm": null,
+          "shell_min_thickness_mm": null,
+          "head_orig_thickness_mm": null,
+          "head_thickness_mm": null,
+          "inspector": "NOT FOUND IN REPORT",
+          "recommendation": "NOT FOUND IN REPORT",
+          "_extracted_fields": [],
+          "_defaulted_fields": [
+            "equipment_id",
+            "report_no",
+            "design_pressure_kg_cm2",
+            "design_temp_c",
+            "shell_min_thickness_mm",
+            "head_thickness_mm"
+          ]
+        },
+        "rag_context": null,
+        "execution_time_ms": 0.0,
+        "fallback_warning": null,
+        "error": "Critical fields not found in source text: ['equipment_id', 'design_pressure_kg_cm2', 'shell_min_thickness_mm']"
+      },
+      "status": "requires_verification",
+      "is_verified": false,
+      "reasoning_trace": "",
+      "execution_time_ms": 1.48
+    }
+  ],
+  "current_step_index": 2,
+  "total_steps": 7,
+  "checkpoint_id": "chk_UNKNOWN_1789447974_672d75",
+  "checkpoint_path": "E:\\SovereignAI\\workspace_sandbox\\checkpoints\\chk_UNKNOWN_1789447974_672d75.json",
+  "halt_reason": "Step 2 (Extract findings) requires human review: ToolResult status='requires_verification', is_verified=False. Detail: Critical fields not found in source text: ['equipment_id', 'design_pressure_kg_cm2', 'shell_min_thickness_mm']",
+  "failed_step": 2,
+  "execution_trace": "Step 1: Read inspection report -> HALTED: Step 2 requires human verification",
+  "context_state": {
+    "user_goal": "Analyze this image C:\\Users\\hp\\AppData\\Local\\Temp\\pytest-of-hp\\pytest-348\\test_agent_handle_preserves_vi0\\sample_inspection.jpg",
+    "report_filename": "pressure_vessel_inspection_002.md",
+    "force_ungrounded_calc": false,
+    "raw_report_text": "",
+    "findings": {
+      "equipment_id": "UNKNOWN",
+      "equipment_name": "UNKNOWN",
+      "report_no": "UNKNOWN",
+      "design_pressure_kg_cm2": null,
+      "design_pressure_unit": "kg/cm2g",
+      "design_temp_c": null,
+      "shell_orig_thickness_mm": null,
+      "shell_min_thickness_mm": null,
+      "head_orig_thickness_mm": null,
+      "head_thickness_mm": null,
+      "inspector": "NOT FOUND IN REPORT",
+      "recommendation": "NOT FOUND IN REPORT",
+      "_extracted_fields": [],
+      "_defaulted_fields": [
+        "equipment_id",
+        "report_no",
+        "design_pressure_kg_cm2",
+        "design_temp_c",
+        "shell_min_thickness_mm",
+        "head_thickness_mm"
+      ]
+    },
+    "equipment_id": "UNKNOWN"
+  },
+  "total_execution_time_ms": 0.0,
+  "created_at_iso": "2026-09-15T04:52:54.420480+00:00",
+  "updated_at_iso": "2026-09-15T04:52:54.424252+00:00"
+}

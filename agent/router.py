@@ -23,7 +23,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 _THIS_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path("agent").resolve()
 _PROJECT_ROOT = _THIS_DIR.parent if _THIS_DIR.name == "agent" else Path(".").resolve()
@@ -42,11 +42,13 @@ logger = logging.getLogger(__name__)
 
 class Capability(str, Enum):
     """Logical capability the router maps a task to."""
-    RAG        = "rag"        # document-grounded Q&A via RAGPipeline
-    CALCULATION = "calculation"  # numerical / engineering verification
-    CODING     = "coding"     # code / script generation
-    VISION     = "vision"     # image / OCR / diagram understanding
-    UNKNOWN    = "unknown"    # no rule matched; falls back to RAG with warning
+    RAG                 = "rag"                  # document-grounded Q&A via RAGPipeline
+    DOCUMENT_GENERATION = "document_generation"  # grounded report/file artifact generation
+    CALCULATION         = "calculation"          # numerical / engineering verification
+    CODING              = "coding"               # code / script generation
+    VISION              = "vision"               # image / OCR / diagram understanding
+    IMAGE_GENERATION    = "image_generation"     # local text-to-image synthesis
+    UNKNOWN             = "unknown"              # no rule matched; falls back to RAG with warning
 
 
 # ── Routing outcome ────────────────────────────────────────────────────────
@@ -57,13 +59,13 @@ class RoutingDecision:
 
     Fields
     ------
-    capability           : The capability the router selected (rag | calculation | coding | vision | unknown).
+    capability           : The capability the router selected (rag | calculation | coding | vision | image_generation | unknown).
     archetype            : Recommended PromptArchetype (RAG tasks only).
     model_record         : The ModelRecord that will serve this task, or None
                            if capability_available is False.
     capability_available : True if a ready model exists for the capability.
     tool_name            : Specific tool to execute (e.g. 'calculator', 'rag_pipeline',
-                           'code_interpreter', 'vision_inspector'), or None.
+                           'code_interpreter', 'vision_inspector', 'image_generator'), or None.
     use_rag_context      : True if the task requires RAG context retrieval (e.g. looking
                            up parameters or document grounding).
     fallback_warning     : Structured warning string for low-confidence/unknown fallbacks,
@@ -110,6 +112,18 @@ class RoutingDecision:
 
 _ROUTING_RULES: List[Tuple[Capability, PromptArchetype, List[str]]] = [
 
+    # ── Document / Report / Artifact generation ───────────────────────────
+    (
+        Capability.DOCUMENT_GENERATION,
+        PromptArchetype.REPORT,
+        [
+            r"re:.*\b(?:create|generate|export|prepare|save|output|produce|build|draft|write|download|make)\b.*\b(?:actual\s+)?(?:pdf|docx|word\s+document|excel|spreadsheet|xlsx|powerpoint|pptx)\b",
+            r"re:.*\b(?:pdf|docx|xlsx|pptx)\s+(?:file|document|report|artifact|export)\b",
+            r"re:.*\bexport\s+(?:as|to)\s*(?:pdf|docx|word|excel|xlsx|pptx|powerpoint)\b",
+            r"re:.*\bas\s+(?:an?\s+)?(?:actual\s+)?(?:pdf|docx|xlsx|pptx)\s+artifact\b",
+        ],
+    ),
+
     # ── Code / script generation ──────────────────────────────────────────
     (
         Capability.CODING,
@@ -119,6 +133,17 @@ _ROUTING_RULES: List[Tuple[Capability, PromptArchetype, List[str]]] = [
             "write python", "write sql", "generate sql", "generate python",
             "create a function", "implement a", "code snippet", "write function",
             "script to", "automate", "generate report script",
+        ],
+    ),
+
+    # ── Image Generation / Visual Synthesis ──────────────────────────────
+    (
+        Capability.IMAGE_GENERATION,
+        PromptArchetype.GENERAL_QA,
+        [
+            r"re:.*\b(?:generate|create|make|render|draw|produce|synthesize|output|build|paint|sketch|illustrate)\b.*\b(?:an?\s+)?(?:image|picture|photo|photograph|illustration|diagram|rendering|graphic|visual\s+representation|visual|schematic\s+image)\b",
+            r"re:.*\b(?:text-to-image|txt2img|stable\s*diffusion|diffusion\s*image|diffusion\s*model)\b",
+            r"re:.*\b(?:visual\s+representation\s+of)\b",
         ],
     ),
 
@@ -286,7 +311,7 @@ class TaskRouter:
         capability, archetype, matched = self._match_rules(normalized)
 
         # Resolve execution tool and RAG context requirement
-        tool_name, use_rag_context = self._resolve_tool(capability)
+        tool_name, use_rag_context = self._resolve_tool(capability, task=normalized)
 
         # Resolve model, audit reason, and structured fallback warning
         model_record, available, reason, fallback_warning = self._resolve_model(
@@ -338,14 +363,15 @@ class TaskRouter:
         return Capability.UNKNOWN, PromptArchetype.GENERAL_QA, []
 
     @staticmethod
-    def _resolve_tool(capability: Capability) -> Tuple[Optional[str], bool]:
+    def _resolve_tool(capability: Capability, task: str = "") -> Tuple[Optional[str], bool]:
         """Determine which execution tool to run and whether RAG context is required.
 
         Returns
         -------
         (tool_name, use_rag_context)
           - tool_name: e.g. 'calculator' for calculation, 'rag_pipeline' for RAG,
-                       'code_interpreter' for coding, 'vision_inspector' for vision.
+                       'code_interpreter' for coding, 'vision_inspector' for vision,
+                       'pdf_generator' / 'document_generator' / 'xlsx_generator' for artifacts.
           - use_rag_context: True if tool_executor should retrieve document context/specs
                              first before executing the tool.
         """
@@ -353,6 +379,17 @@ class TaskRouter:
             # Calculation requires deterministic tool computation, but uses RAG
             # pipeline to look up vessel specs / design parameters from docs first.
             return "calculator", True
+        elif capability == Capability.DOCUMENT_GENERATION:
+            t_lower = task.lower()
+            if any(k in t_lower for k in ["xlsx", "excel", "spreadsheet"]):
+                return "xlsx_generator", True
+            elif any(k in t_lower for k in ["pptx", "powerpoint", "slide"]):
+                return "pptx_generator", True
+            elif any(k in t_lower for k in ["docx", "word"]):
+                return "document_generator", True
+            return "pdf_generator", True
+        elif capability == Capability.IMAGE_GENERATION:
+            return "image_generator", False
         elif capability in (Capability.RAG, Capability.UNKNOWN):
             return "rag_pipeline", True
         elif capability == Capability.CODING:
@@ -437,14 +474,10 @@ class TaskRouter:
     ) -> Tuple[Optional[ModelRecord], bool, str, Optional[str]]:
         """Determine model availability, compose the audit-trail reason, and set fallback warning."""
 
-        # CALCULATION: uses RAG pipeline for context + a calc tool
+        # CALCULATION / DOCUMENT_GENERATION: uses RAG pipeline for context + tool
         # Map it to the RAG role for model resolution
         effective_role = capability.value
-        if capability == Capability.CALCULATION:
-            effective_role = "rag"
-
-        # UNKNOWN: treat as RAG with a warning
-        if capability == Capability.UNKNOWN:
+        if capability in (Capability.CALCULATION, Capability.DOCUMENT_GENERATION, Capability.UNKNOWN):
             effective_role = "rag"
 
         # Model choice is capability-driven.  Roles remain as a compatibility
@@ -453,6 +486,7 @@ class TaskRouter:
         capability_key = {
             Capability.VISION: "vision",
             Capability.CODING: "code_generation",
+            Capability.IMAGE_GENERATION: "image_generation",
         }.get(capability)
         ready_models = (
             self._registry.ready_for_capability(capability_key)
@@ -521,6 +555,11 @@ class TaskRouter:
                 f"Routing to calculation tool ('calculator') with RAG context from "
                 f"{model.hf_repo_id} (archetype: {archetype.value}). {model_selection_reason}"
             )
+        elif capability == Capability.IMAGE_GENERATION:
+            reason = (
+                f"Task contains image generation keywords {matched!r}. "
+                f"Routing to local diffusion tool ('image_generator') via {model.hf_repo_id}."
+            )
         else:
             kw_preview = matched[:3]
             extra = f" (+{len(matched)-3} more)" if len(matched) > 3 else ""
@@ -532,6 +571,122 @@ class TaskRouter:
             )
 
         return model, True, reason, fallback_warning
+
+    def extract_generation_params(self, task: str, **kwargs: Any) -> Dict[str, Any]:
+        """Extract inline and explicit parameters for image generation requests."""
+        return extract_image_generation_params(task, **kwargs)
+
+
+# ── Natural Language Parameter Extractor for Image Generation ──────────────
+
+def extract_image_generation_params(text: str, **kwargs: Any) -> Dict[str, Any]:
+    """Extract natural-language and structured parameters for image generation.
+
+    Handles explicit keyword arguments as highest priority, then parses inline
+    dimensions (e.g. 512x512), inference steps, random seeds, CFG guidance scale,
+    negative prompts, target filenames, and cleans the prompt string.
+    """
+    params: Dict[str, Any] = {}
+    consumed_spans: List[Tuple[int, int]] = []
+
+    # 1. Start with explicit keyword arguments if provided
+    for k in ("negative_prompt", "width", "height", "steps", "guidance_scale", "seed", "filename", "filename_prefix"):
+        if k in kwargs and kwargs[k] is not None:
+            params[k] = kwargs[k]
+
+    # 2. Extract dimensions: e.g. "512x512", "768x512", "width=512, height=512", "--width 512"
+    if "width" not in params or "height" not in params:
+        dim_match = re.search(r"\b(\d{2,4})\s*[xX*]\s*(\d{2,4})\b", text)
+        if dim_match:
+            params.setdefault("width", int(dim_match.group(1)))
+            params.setdefault("height", int(dim_match.group(2)))
+            consumed_spans.append(dim_match.span())
+
+    if "width" not in params:
+        w_match = re.search(r"(?:--width|-w|width\s*[:=])\s*(\d+)", text, re.IGNORECASE)
+        if w_match:
+            params["width"] = int(w_match.group(1))
+            consumed_spans.append(w_match.span())
+
+    if "height" not in params:
+        h_match = re.search(r"(?:--height|-h|height\s*[:=])\s*(\d+)", text, re.IGNORECASE)
+        if h_match:
+            params["height"] = int(h_match.group(1))
+            consumed_spans.append(h_match.span())
+
+    # 3. Extract steps: e.g. "steps: 25", "--steps 25", "steps=25", "25 steps"
+    if "steps" not in params:
+        steps_match = re.search(r"(?:--steps|steps\s*[:=])\s*(\d+)", text, re.IGNORECASE) or re.search(r"\b(\d+)\s+steps\b", text, re.IGNORECASE)
+        if steps_match:
+            params["steps"] = int(steps_match.group(1))
+            consumed_spans.append(steps_match.span())
+
+    # 4. Extract guidance scale / CFG: e.g. "guidance: 7.5", "--guidance 7.5", "cfg: 7.5", "scale: 7.5"
+    if "guidance_scale" not in params:
+        cfg_match = re.search(r"(?:--guidance(?:_scale)?|--cfg|guidance\s*[:=]|cfg\s*[:=]|scale\s*[:=])\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+        if cfg_match:
+            params["guidance_scale"] = float(cfg_match.group(1))
+            consumed_spans.append(cfg_match.span())
+
+    # 5. Extract seed: e.g. "seed: 42", "--seed 42", "seed=42", "seed 42"
+    if "seed" not in params:
+        seed_match = re.search(r"(?:--seed|seed\s*[:=]|\bseed\s+)(\d+)", text, re.IGNORECASE)
+        if seed_match:
+            params["seed"] = int(seed_match.group(1))
+            consumed_spans.append(seed_match.span())
+
+    # 6. Extract filename: e.g. "save as pump.png", "filename: pump.png", "to pump.png", "--filename pump.png"
+    if "filename" not in params:
+        fn_match = re.search(r"(?:save\s+(?:as|to)|filename\s*[:=]|--filename|-f)\s*([a-zA-Z0-9_\-]+\.png)", text, re.IGNORECASE)
+        if fn_match:
+            params["filename"] = fn_match.group(1).strip()
+            consumed_spans.append(fn_match.span())
+
+    # 7. Extract negative prompt: e.g. "--negative blurry, noisy", "negative: blurry, distorted"
+    if "negative_prompt" not in params:
+        neg_match = re.search(r"(?:--negative(?:_prompt)?|negative\s*prompt\s*[:=]|negative\s*[:=])\s*([^-\n;]+)", text, re.IGNORECASE)
+        if neg_match:
+            neg_val = neg_match.group(1).strip()
+            # If "save as ..." was trailing in neg_val, trim it
+            neg_val = re.sub(r"(?:save\s+(?:as|to)|filename\s*[:=]|--\w+).*", "", neg_val, flags=re.IGNORECASE).strip()
+            if neg_val:
+                params["negative_prompt"] = neg_val.strip(", ")
+                consumed_spans.append(neg_match.span())
+
+    # 8. Prompt extraction
+    if "prompt" in kwargs and kwargs["prompt"]:
+        params["prompt"] = kwargs["prompt"]
+    else:
+        # Rebuild text removing consumed spans
+        cleaned_chars = list(text)
+        for start, end in sorted(consumed_spans, reverse=True):
+            cleaned_chars[start:end] = " "
+        cleaned = "".join(cleaned_chars)
+
+        # Remove extra punctuation/flags remnants
+        cleaned = re.sub(r"--\w+\b", " ", cleaned)
+        cleaned = re.sub(r"[()]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        # Strip leading trigger phrases like "generate an image of", "create a picture of", etc.
+        cleaned_prompt = re.sub(
+            r"^\s*(?:please\s+)?(?:generate|create|make|render|draw|produce|synthesize|output|build|paint|sketch)\s+(?:an?\s+)?(?:image|picture|photo|photograph|illustration|diagram|rendering|graphic|visual\s+representation|visual)\s+(?:of|showing|depicting|illustrating|for|with)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        # Strip leading articles like "a boiler" -> "boiler" or keep
+        if cleaned_prompt.lower().startswith("a ") and len(cleaned_prompt) > 2:
+            cleaned_prompt = cleaned_prompt[2:].strip()
+        elif cleaned_prompt.lower().startswith("an ") and len(cleaned_prompt) > 3:
+            cleaned_prompt = cleaned_prompt[3:].strip()
+        elif cleaned_prompt.lower().startswith("the ") and len(cleaned_prompt) > 4:
+            cleaned_prompt = cleaned_prompt[4:].strip()
+
+        params["prompt"] = cleaned_prompt if len(cleaned_prompt) >= 2 else text.strip()
+
+    return params
 
 
 # ── Module-level singleton ────────────────────────────────────────────────

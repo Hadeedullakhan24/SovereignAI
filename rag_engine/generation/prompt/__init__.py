@@ -48,6 +48,14 @@ from rag_engine.generation.prompt.prompt_templates import (
     PromptRegistry,
     PromptTemplate,
     PromptTemplateRegistry,
+    detect_task_type,
+)
+from rag_engine.generation.prompt.task_intent import (
+    EmailPurpose,
+    OutputFormat,
+    TaskIntent,
+    TaskIntentClassifier,
+    TaskOperation,
 )
 from rag_engine.generation.prompt.prompt_validator import PromptValidator
 from rag_engine.generation.prompt.system_prompt_manager import SystemPromptManager
