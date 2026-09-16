@@ -1,0 +1,9 @@
+from abc import ABC,abstractmethod
+from pathlib import Path
+class StorageProvider(ABC):
+ @abstractmethod
+ async def save(self,content:bytes,filename:str)->Path: ...
+ @abstractmethod
+ async def get(self,filename:str)->Path: ...
+ @abstractmethod
+ async def delete(self,filename:str)->None: ...
