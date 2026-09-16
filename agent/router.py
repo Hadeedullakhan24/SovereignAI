@@ -418,6 +418,80 @@ class TaskRouter:
         self, normalized: str
     ) -> Tuple[TaskType, Capability, PromptArchetype, List[str]]:
         """Return (task_type, capability, archetype, matched_keywords) for first matching rule."""
+        from agent.intent import (
+            ActionType,
+            OutputModality,
+            classify_intent,
+        )
+
+        intent = classify_intent(normalized)
+
+        # 1. Image Generation Intent: Highest precedence over visual keywords
+        if intent.is_image_generation:
+            return (
+                TaskType.IMAGE_GENERATION,
+                Capability.IMAGE_GENERATION,
+                PromptArchetype.GENERAL_QA,
+                intent.matched_cues or ["image_generation"],
+            )
+
+        # 2. Existing Visual Analysis / Inspection Intent
+        if intent.is_existing_visual_analysis:
+            drawing_cues = [
+                "p&id", "pid", "piping and instrumentation", "engineering drawing",
+                "schematic diagram", "pfd", "process flow diagram", "isometric drawing",
+                "blue print", "blueprint", "ga drawing", "wiring diagram", "loop diagram",
+                "logic diagram", "drawing analysis", "p&id drawing", "read drawing",
+                "analyze drawing", "inspect drawing", "schematic",
+            ]
+            is_eng_drawing = any(
+                (cue in normalized if " " in cue else bool(re.search(rf"\b{re.escape(cue)}\b", normalized)))
+                for cue in drawing_cues
+            )
+            if is_eng_drawing:
+                return (
+                    TaskType.ENGINEERING_DRAWING_ANALYSIS,
+                    Capability.VISION,
+                    PromptArchetype.GENERAL_QA,
+                    intent.matched_cues or ["engineering_drawing"],
+                )
+            return (
+                TaskType.VISION_OCR,
+                Capability.VISION,
+                PromptArchetype.GENERAL_QA,
+                intent.matched_cues or ["vision_ocr"],
+            )
+
+        # 3. Document File Generation (PDF, DOCX, XLSX, PPTX)
+        if intent.output_modality == OutputModality.DOCUMENT_FILE or (
+            intent.action == ActionType.CREATE_NEW and intent.output_modality == OutputModality.DOCUMENT_FILE
+        ):
+            return (
+                TaskType.DOCUMENT_GENERATION,
+                Capability.DOCUMENT_GENERATION,
+                PromptArchetype.REPORT,
+                intent.matched_cues or ["document_generation"],
+            )
+
+        # 4. Numerical Calculation
+        if intent.action == ActionType.CALCULATE or intent.output_modality == OutputModality.NUMERICAL_RESULT:
+            return (
+                TaskType.CALCULATION,
+                Capability.CALCULATION,
+                PromptArchetype.EQUIPMENT_LOOKUP,
+                intent.matched_cues or ["calculation"],
+            )
+
+        # 5. Code Generation / Scripting
+        if intent.action == ActionType.WRITE_CODE or intent.output_modality == OutputModality.CODE:
+            return (
+                TaskType.CODING,
+                Capability.CODING,
+                PromptArchetype.GENERAL_QA,
+                intent.matched_cues or ["coding"],
+            )
+
+        # 6. Walk domain rules for text QA / specialized RAG archetypes
         for task_type, capability, archetype, keywords in _ROUTING_RULES:
             hits = []
             for kw in keywords:
@@ -595,6 +669,13 @@ class TaskRouter:
             if phi_model is not None:
                 return phi_model, f"Selected {phi_model.hf_repo_id}: context lookup model for CALCULATION."
             return ready_models[0], f"Selected {ready_models[0].hf_repo_id}: available model for CALCULATION."
+
+        # 11. IMAGE_GENERATION -> local Stable Diffusion model
+        if task_type == TaskType.IMAGE_GENERATION:
+            diff_model = next((m for m in ready_models if "diffusion" in m.family.lower() or "stable-diffusion" in m.hf_repo_id.lower() or m.role == "image_generation"), None)
+            if diff_model is not None:
+                return diff_model, f"Selected {diff_model.hf_repo_id}: local diffusion model for IMAGE_GENERATION."
+            return ready_models[0], f"Selected {ready_models[0].hf_repo_id}: available model for IMAGE_GENERATION."
 
         # Fallback for general RAG / unknown:
         matched_long = [kw for kw in self.LONG_CONTEXT_KEYWORDS if kw in task_lower]

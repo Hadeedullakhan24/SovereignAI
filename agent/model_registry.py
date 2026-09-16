@@ -91,8 +91,8 @@ class ModelRecord:
                 return True
 
         # Diffusion model check (e.g. Stable Diffusion)
-        if (self.local_path / "model_index.json").exists() and (self.local_path / "unet").exists():
-            if self.role in ("image_generation", "diffusion") or "image_generation" in self.capabilities or self.family == "stable_diffusion":
+        if self.role in ("image_generation", "diffusion") or "image_generation" in self.capabilities or self.family == "stable_diffusion":
+            if (self.local_path / "model_index.json").exists() or self.local_path.exists():
                 self._installed = True
                 return True
 

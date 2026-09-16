@@ -59,7 +59,7 @@ def verify_model_integrity(model_dir: Path) -> dict[str, Any]:
     Checks:
       1. config.json exists.
       2. Tokenizer assets exist (tokenizer.json or tokenizer_config.json or vocab.json).
-      3. Model weight files exist (.safetensors, .index.json, or .bin).
+      3. Transformers-compatible model weight files exist (.safetensors or pytorch_model*.bin).
       4. Computes SHA-256 checksums of core configuration and metadata files.
     """
     if not model_dir.exists():
@@ -80,14 +80,18 @@ def verify_model_integrity(model_dir: Path) -> dict[str, Any]:
     if not has_tokenizer:
         return {"valid": False, "error": f"Tokenizer files missing in {model_dir}"}
 
-    # 3. Check model weights
+    # 3. Check Transformers-compatible model weights
+    # Valid weights include *.safetensors (or sharded safetensors indexed via model.safetensors.index.json)
+    # and pytorch_model*.bin (excluding training_args.bin). ONNX files are NOT valid for AutoModelForCausalLM.
     weights = [
         f for f in (list(model_dir.glob("*.safetensors")) + list(model_dir.glob("pytorch_model*.bin")))
         if f.name != "training_args.bin"
     ]
-    onnx_weights = list((model_dir / "onnx").glob("*.onnx")) if (model_dir / "onnx").exists() else []
-    if not weights and not onnx_weights and not (model_dir / "model.safetensors.index.json").exists():
-        return {"valid": False, "error": f"No model weight files (.safetensors, pytorch_model*.bin, or onnx) found in {model_dir}"}
+    if not weights:
+        return {
+            "valid": False,
+            "error": f"No Transformers-compatible model weight files (.safetensors or pytorch_model*.bin) found in {model_dir}",
+        }
 
     # 4. Compute checksums of key config files
     file_checksums: dict[str, str] = {}
@@ -99,7 +103,7 @@ def verify_model_integrity(model_dir: Path) -> dict[str, Any]:
     return {
         "valid": True,
         "model_dir": str(model_dir.resolve()),
-        "weights_count": len(weights) + len(onnx_weights),
+        "weights_count": len(weights),
         "file_checksums": file_checksums,
     }
 
@@ -107,7 +111,9 @@ def verify_model_integrity(model_dir: Path) -> dict[str, Any]:
 def verify_offline_loading(model_dir: Path) -> dict[str, Any]:
     """Verify strictly offline model loading with local_files_only=True."""
     try:
-        from transformers import AutoConfig, AutoTokenizer
+        import gc
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         logger.info("Verifying offline tokenizer loading from %s (local_files_only=True)...", model_dir)
         config = AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
@@ -118,11 +124,32 @@ def verify_offline_loading(model_dir: Path) -> dict[str, Any]:
         if not tokens:
             return {"valid": False, "error": "Tokenizer produced empty token list"}
 
-        logger.info("Offline verification successful. Model config type: %s, Vocab size: %d", config.model_type, len(tokenizer))
+        logger.info("Verifying offline AutoModelForCausalLM loading from %s (local_files_only=True)...", model_dir)
+        model = AutoModelForCausalLM.from_pretrained(
+            str(model_dir),
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+            trust_remote_code=False,
+        )
+        param_count = sum(p.numel() for p in model.parameters())
+
+        # Release model from memory
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.info(
+            "Offline verification successful. Model config type: %s, Vocab size: %d, Parameters: %d",
+            config.model_type,
+            len(tokenizer),
+            param_count,
+        )
         return {
             "valid": True,
             "model_type": config.model_type,
             "vocab_size": len(tokenizer),
+            "parameters": param_count,
         }
     except Exception as e:
         logger.error("Offline loading verification failed: %s", e)

@@ -643,23 +643,102 @@ def test_llm_download_and_integrity_verification_contracts(tmp_path):
     assert "HuggingFaceTB/SmolLM2-1.7B-Instruct" in TARGET_MODELS
     assert "microsoft/Phi-3.5-mini-instruct" in TARGET_MODELS
 
-    # Non-existent dir
+    # 1. Non-existent dir => INVALID
     res = verify_model_integrity(tmp_path / "non_existent")
     assert not res["valid"]
 
-    # Incomplete dir (missing config.json)
+    # 2. Incomplete dir (missing config.json) => INVALID
     mock_model_dir = tmp_path / "mock_llm"
     mock_model_dir.mkdir()
     res2 = verify_model_integrity(mock_model_dir)
     assert not res2["valid"]
     assert "config.json missing" in res2["error"]
 
-    # Valid mock assets
+    # 3. Missing tokenizer files => INVALID
     (mock_model_dir / "config.json").write_text('{"model_type": "qwen2"}', encoding="utf-8")
-    (mock_model_dir / "tokenizer.json").write_text('{"vocab": {}}', encoding="utf-8")
     (mock_model_dir / "model.safetensors").write_bytes(b"MOCK_WEIGHTS_CONTENT")
+    res_tok_missing = verify_model_integrity(mock_model_dir)
+    assert not res_tok_missing["valid"]
+    assert "Tokenizer files missing" in res_tok_missing["error"]
 
+    # Add tokenizer
+    (mock_model_dir / "tokenizer.json").write_text('{"vocab": {}}', encoding="utf-8")
+
+    # 4. Valid mock assets (config + tokenizer + safetensors) => VALID
     res3 = verify_model_integrity(mock_model_dir)
     assert res3["valid"]
+    assert res3["weights_count"] == 1
     assert "config.json" in res3["file_checksums"]
     assert len(res3["file_checksums"]["config.json"]) == 64
+
+    # 5. Directory with config + tokenizer + ONNX only => INVALID (must NEVER pass for causal LMs)
+    onnx_only_dir = tmp_path / "onnx_only_llm"
+    onnx_only_dir.mkdir()
+    (onnx_only_dir / "config.json").write_text('{"model_type": "smollm"}', encoding="utf-8")
+    (onnx_only_dir / "tokenizer.json").write_text('{"vocab": {}}', encoding="utf-8")
+    onnx_subdir = onnx_only_dir / "onnx"
+    onnx_subdir.mkdir()
+    (onnx_subdir / "model.onnx").write_bytes(b"MOCK_ONNX_CONTENT")
+    (onnx_subdir / "model_bnb4.onnx").write_bytes(b"MOCK_ONNX_BNB4")
+    res_onnx = verify_model_integrity(onnx_only_dir)
+    assert not res_onnx["valid"]
+    assert "No Transformers-compatible model weight files" in res_onnx["error"]
+
+    # 6. Missing Transformers weights (no safetensors / bin) => INVALID
+    no_weights_dir = tmp_path / "no_weights_llm"
+    no_weights_dir.mkdir()
+    (no_weights_dir / "config.json").write_text('{"model_type": "phi3"}', encoding="utf-8")
+    (no_weights_dir / "tokenizer.json").write_text('{"vocab": {}}', encoding="utf-8")
+    res_no_weights = verify_model_integrity(no_weights_dir)
+    assert not res_no_weights["valid"]
+    assert "No Transformers-compatible model weight files" in res_no_weights["error"]
+
+    # 7. Only training_args.bin present => INVALID (not model weights)
+    (no_weights_dir / "training_args.bin").write_bytes(b"MOCK_TRAINING_ARGS")
+    res_train_args = verify_model_integrity(no_weights_dir)
+    assert not res_train_args["valid"]
+
+    # 8. PyTorch bin weights => VALID
+    (no_weights_dir / "pytorch_model.bin").write_bytes(b"MOCK_PYTORCH_WEIGHTS")
+    res_pytorch_bin = verify_model_integrity(no_weights_dir)
+    assert res_pytorch_bin["valid"]
+    assert res_pytorch_bin["weights_count"] == 1
+
+
+def test_offline_causal_lm_loading_and_real_model_verification(tmp_path):
+    """Verify offline AutoModelForCausalLM loading checks and real disk model integrity."""
+    from scripts.download_llm_models import (
+        verify_model_integrity,
+        verify_offline_loading,
+    )
+
+    # 1. Offline loading failure on empty / mock weights that cannot be loaded by AutoModelForCausalLM
+    mock_dir = tmp_path / "bad_model"
+    mock_dir.mkdir()
+    (mock_dir / "config.json").write_text('{"model_type": "invalid_xyz"}', encoding="utf-8")
+    (mock_dir / "tokenizer.json").write_text('{"vocab": {}}', encoding="utf-8")
+    res_bad = verify_offline_loading(mock_dir)
+    assert not res_bad["valid"]
+    assert "error" in res_bad
+
+    # 2. Real SmolLM2 directory (incomplete - missing safetensors) => INVALID for both checks
+    smollm_dir = Path("models/llm/smollm2-1.7b-instruct")
+    if smollm_dir.exists():
+        integrity_smollm = verify_model_integrity(smollm_dir)
+        assert not integrity_smollm["valid"]
+        assert "No Transformers-compatible model weight files" in integrity_smollm["error"]
+        loading_smollm = verify_offline_loading(smollm_dir)
+        assert not loading_smollm["valid"]
+
+    # 3. Real Qwen directory (complete) => VALID for both checks
+    qwen_dir = Path("models/llm/qwen2.5-1.5b-instruct")
+    if qwen_dir.exists() and (qwen_dir / "model.safetensors").exists():
+        integrity_qwen = verify_model_integrity(qwen_dir)
+        assert integrity_qwen["valid"]
+        assert integrity_qwen["weights_count"] >= 1
+        assert "config.json" in integrity_qwen["file_checksums"]
+        loading_qwen = verify_offline_loading(qwen_dir)
+        assert loading_qwen["valid"]
+        assert loading_qwen["model_type"] == "qwen2"
+        assert loading_qwen["vocab_size"] > 0
+        assert loading_qwen["parameters"] > 1_000_000_000
