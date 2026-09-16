@@ -46,7 +46,12 @@ class IndexManager:
         self.payload_validator = payload_validator or PayloadValidator()
         store_config = getattr(store, "config", None)
         journal_dir = getattr(store_config, "journal_path", None)
-        self.tx_manager = tx_manager or TransactionManager(store, journal_dir=journal_dir) if journal_dir else TransactionManager(store)
+        wal_enabled = getattr(store_config, "enable_wal_journal", True)
+        self.tx_manager = tx_manager or (
+            TransactionManager(store, journal_dir=journal_dir, enabled=wal_enabled)
+            if journal_dir
+            else TransactionManager(store, enabled=wal_enabled)
+        )
         self.reconciler = reconciler or IncrementalIndexer(store)
         self.manifest_path = manifest_path or (
             getattr(store_config, "storage_path", Path("vector_db/qdrant")).parent / "index_manifest.json"

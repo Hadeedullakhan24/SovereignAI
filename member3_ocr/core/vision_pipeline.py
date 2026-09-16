@@ -1157,12 +1157,19 @@ class LocalQwenVisionBackend(LocalVisionBackendBase):
             self.config.model_path if self.config.model_path is not None
             else self._DEFAULT_MODEL_PATH
         )
-        if candidate.exists():
+        project_root = Path(__file__).resolve().parents[2]
+        if candidate.is_absolute() and candidate.exists():
             model_path = candidate
+        elif candidate.exists():
+            model_path = candidate
+        elif (project_root / candidate).exists():
+            model_path = project_root / candidate
+        elif (Path("e:/SovereignAI") / candidate).exists():
+            model_path = Path("e:/SovereignAI") / candidate
         elif (Path("c:/SovereignAI") / candidate).exists():
             model_path = Path("c:/SovereignAI") / candidate
         else:
-            model_path = candidate
+            model_path = project_root / candidate
 
         if not model_path.exists():
             raise MissingVisionModelError(

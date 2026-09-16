@@ -38,10 +38,16 @@ class DeterministicTestLLM(BaseLocalLLM):
         # 1. Extract question
         question = ""
         q_match = re.search(
-            r"(?:=== USER QUERY ===|Question|Query|USER QUERY)\s*:?\s*(.*?)(?:\n===|\n\n[A-Z]|\Z)",
+            r"===\s*USER QUERY\s*===\s*\n(.*?)(?=\n===|\Z)",
             prompt,
             re.DOTALL | re.IGNORECASE,
         )
+        if not q_match:
+            q_match = re.search(
+                r"(?:^|\n)(?:Question|Query):\s*(.*?)(?:\n===|\n\n[A-Z]|\Z)",
+                prompt,
+                re.DOTALL | re.IGNORECASE,
+            )
         if q_match:
             question = q_match.group(1).strip()
 
@@ -216,7 +222,7 @@ class DeterministicTestLLM(BaseLocalLLM):
                 intro = f"Please find below the documented information:"
 
             body_pts = "\n".join(email_points) if email_points else "• Documented details are outlined in the source records."
-            return (
+            raw_email = (
                 f"{subj}\n\n"
                 f"{salutation}\n\n"
                 f"{intro}\n\n"
@@ -224,6 +230,8 @@ class DeterministicTestLLM(BaseLocalLLM):
                 f"Best regards,\n"
                 f"[Engineering Team]"
             )
+            from rag_engine.generation.response_formatter import ResponseFormatter
+            return ResponseFormatter.sanitize_email_output(raw_email)
 
         # Collect top distinct matching sentences for direct QA
         selected: list[str] = []

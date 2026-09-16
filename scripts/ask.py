@@ -41,6 +41,7 @@ from rag_engine.generation.models.model_registry import LLMRegistry
 from rag_engine.generation.prompt.prompt_templates import PromptArchetype
 from rag_engine.generation.response_formatter import ResponseFormatter
 from rag_engine.pipeline.rag_pipeline import RAGPipeline, RAGResponse
+from agent.offline_proof import OfflineGuard
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mrpl_ask_cli")
@@ -96,7 +97,7 @@ def run_interactive_repl(
                 decision = get_router().route(query)
                 from rag_engine.generation.prompt.task_intent import TaskClassifier
                 intent = TaskClassifier.classify(query)
-                if intent.is_artifact_request or decision.capability == Capability.IMAGE_GENERATION:
+                if intent.is_artifact_request or intent.output_format.value == "email" or decision.capability in (Capability.IMAGE_GENERATION, Capability.CALCULATION):
                     print("\nAssistant")
                     response = pipeline.answer(
                         question=query,
@@ -142,14 +143,15 @@ def run_interactive_repl(
                         citations=citations,
                     )
 
-                    clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
-                    concise_sources = ResponseFormatter.format_concise_sources(
-                        retrieval_res.citations,
-                        query=query,
-                        answer=clean_ans,
-                    )
-                    if concise_sources:
-                        print(f"\n{concise_sources}")
+                    if intent.output_format.value != "email":
+                        clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
+                        concise_sources = ResponseFormatter.format_concise_sources(
+                            retrieval_res.citations,
+                            query=query,
+                            answer=clean_ans,
+                        )
+                        if concise_sources:
+                            print(f"\n{concise_sources}")
             else:
                 print("\nAssistant")
                 response = pipeline.answer(
@@ -338,7 +340,7 @@ def main(args_list: list[str] | None = None) -> None:
             decision = get_router().route(query)
             from rag_engine.generation.prompt.task_intent import TaskClassifier
             intent = TaskClassifier.classify(query)
-            if intent.is_artifact_request or decision.capability == Capability.IMAGE_GENERATION:
+            if intent.is_artifact_request or intent.output_format.value == "email" or decision.capability in (Capability.IMAGE_GENERATION, Capability.CALCULATION):
                 print_banner()
                 print(f"\nYou\n> {query}")
                 print("\nAssistant")
@@ -367,14 +369,15 @@ def main(args_list: list[str] | None = None) -> None:
                 full_answer = "".join(tokens)
                 print()
 
-                clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
-                concise_sources = ResponseFormatter.format_concise_sources(
-                    retrieval_res.citations,
-                    query=query,
-                    answer=clean_ans,
-                )
-                if concise_sources:
-                    print(f"\n{concise_sources}")
+                if intent.output_format.value != "email":
+                    clean_ans = ResponseFormatter.strip_provenance(full_answer).strip()
+                    concise_sources = ResponseFormatter.format_concise_sources(
+                        retrieval_res.citations,
+                        query=query,
+                        answer=clean_ans,
+                    )
+                    if concise_sources:
+                        print(f"\n{concise_sources}")
         else:
             print_banner()
             print(f"\nYou\n> {query}")
@@ -402,4 +405,5 @@ def main(args_list: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    with OfflineGuard(allow_localhost=True):
+        main()

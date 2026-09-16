@@ -368,3 +368,12 @@ def classify_intent(query: str, **kwargs) -> IntentDecision:
         reason="User requested factual information, standard, or procedural explanation from document corpus.",
         matched_cues=matched_cues,
     )
+
+
+class CentralIntentClassifier:
+    """Authoritative classifier wrapper class for Sovereign AI queries."""
+
+    @staticmethod
+    def classify(query: str, **kwargs) -> IntentDecision:
+        return classify_intent(query, **kwargs)
+

@@ -1,0 +1,14 @@
+export type Tokens={access_token:string;refresh_token:string;token_type:string;expires_in:number};
+export type User={id:string;email:string};
+export type TaskState='CREATED'|'QUEUED'|'PLANNING'|'RUNNING'|'WAITING_FOR_APPROVAL'|'COMPLETED'|'FAILED'|'CANCELLED';
+export type Task={id:string;type:string;state:TaskState;result:Record<string,unknown>|null;error:string|null;attempts:number};
+export type StoredFile={id:string;original_name:string;mime_type:string;size_bytes:number;status:string;created_at?:string};
+export type UploadResult={id:string;name:string;status:string;mime_type:string};
+export type Conversation={id:string;title:string|null;agent_name:string|null;model_name:string|null;created_at?:string};
+export type ArtifactInfo={artifact_type:string;filename:string;file_path?:string;file_size_bytes?:number;status?:string;metadata?:Record<string,unknown>};
+export type Message={id:string;conversation_id:string;role:'user'|'assistant';content:string;citations:unknown[];attachments:string[];artifact?:ArtifactInfo|null;created_at?:string};
+export type Agent={id:string;name:string;providers:string[]};
+export type AuditEvent={id:string;actor_id:string|null;action:string;resource_type:string;resource_id:string|null;detail:Record<string,unknown>;created_at?:string};
+export type ChatErrorInfo={code:string;message:string};
+export type ChatResponse={conversation_id:string;message_id:string;content:string;status:string;is_verified:boolean;insufficient_evidence:boolean;citations:unknown[];artifact?:ArtifactInfo|null;tool_results:Record<string,unknown>[];error?:ChatErrorInfo|null};
+export type ApiError={status:number;message:string;requestId?:string};

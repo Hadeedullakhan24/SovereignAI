@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-09-16T00:00:31.363167+00:00",
+  "is_compliant": true,
+  "status": "COMPLIANT",
+  "blocked_count": 0,
+  "allowed_local_count": 0,
+  "duration_ms": 212631.11,
+  "allow_localhost": true,
+  "summary": "PASSED: 0 outbound connections attempted across 212631.1 ms. Airgap compliance 100% verified.",
+  "blocked_attempts": []
+}

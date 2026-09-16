@@ -149,6 +149,167 @@ class ResponseFormatter:
         return "\n".join(deduped_lines)
 
     @staticmethod
+    def sanitize_email_output(
+        text: str,
+        document_names: Sequence[str] | None = None,
+    ) -> str:
+        """Sanitize email text so that it strictly contains only the email itself.
+
+        Removes:
+        1. Conversational preambles before the email header (Subject: or Dear).
+        2. Conversational postambles after the email sign-off (Best regards, etc.).
+        3. Appended or self-generated References, Sources, Provenance, Bibliography sections.
+        4. Inline bracket citations like [1], [2], [1, 2], [1-3], [Citation 1], [Doc 1].
+        5. Document IDs, filenames (e.g. document.pdf), or document record IDs.
+        6. Page numbers (e.g. 'Page 1', 'page 4', '(p. 14)', 'pages 2-3').
+        7. Retrieved-chunk text, markers, or chunk headers (e.g. '--- SOURCE [1] ---').
+        """
+        if not text:
+            return ""
+
+        # 1. Strip trailing References, Sources, Provenance, Citations, Bibliography, Evidence block
+        cleaned = re.split(
+            r"(?:\n|\A)\s*(?:[-*]{3,}\s*\n)?\s*(?:#{1,4}\s*|\*{1,2})?(?:References?|Sources?|Provenance|Citations?|Bibliography|Evidence|Supporting Citations?|Source Documents?)(?:\s*&[^\n]*)?(?:\*{1,2})?(?:\s*:|\n)[\s\S]*",
+            text,
+            flags=re.IGNORECASE,
+        )[0]
+
+        # 2. Remove chunk delimiter lines or headers
+        cleaned = re.sub(
+            r"---+[^\n]*(?:SOURCE|CHUNK|DOCUMENT|CONTEXT)[^\n]*---+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"===+[^\n]*(?:CONTEXT|VERIFIED|INSTRUCTIONS|PROMPT|SYSTEM|USER)[^\n]*===+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^\s*(?:Chunk|Source)\s*ID:\s*[^\n]+$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        cleaned = re.sub(
+            r"^\s*Verbatim Quote:\s*.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+        # 3. Remove inline bracket citations e.g. [1], [2], [1, 2], [1-3], [Citation 1], [Doc 1]
+        cleaned = re.sub(r"\[\s*\d+(?:\s*[,-–—]\s*\d+)*\s*\]", "", cleaned)
+        cleaned = re.sub(
+            r"\[\s*(?:citation|source|ref|reference|doc|document)\s*#?\d+\s*\]",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\(\s*(?:citation|source|ref|reference|doc|document)\s*#?\d+\s*\)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        # 4. Remove document names and IDs
+        if document_names:
+            for doc_name in document_names:
+                if not doc_name or not isinstance(doc_name, str):
+                    continue
+                doc_clean = doc_name.strip()
+                if not doc_clean or len(doc_clean) < 3:
+                    continue
+                esc_doc = re.escape(doc_clean)
+                cleaned = re.sub(
+                    rf"(?:(?:as\s+(?:documented|specified|noted|stated|outlined|described|established)\s+in|according\s+to|as\s+per|refer\s+to|reference|per|in)\s+)?(?:the\s+)?(?:document\s+|file\s+|report\s+|records?\s+)?(?:[\"']?{esc_doc}[\"']?)",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+                cleaned = re.sub(
+                    rf"\(\s*(?:see|refer\s+to\s+)?(?:document\s+|file\s+|report\s+)?[\"']?{esc_doc}[\"']?\s*\)",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                )
+                cleaned = re.sub(rf"\b{esc_doc}\b", "", cleaned, flags=re.IGNORECASE)
+
+        # Remove generic file names with document extensions
+        file_ext_pattern = r"\b[\w\-]+(?:\.(?:pdf|docx?|xlsx?|pptx?|txt|md|eml|csv))\b"
+        cleaned = re.sub(
+            rf"(?:(?:as\s+(?:documented|specified|noted|stated|outlined|described|established)\s+in|according\s+to|as\s+per|refer\s+to|reference|per|in)\s+)?(?:the\s+)?(?:document\s+|file\s+|report\s+|records?\s+)?(?:[\"']?{file_ext_pattern}[\"']?)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            rf"\(\s*(?:see|refer\s+to\s+)?(?:document\s+|file\s+|report\s+)?[\"']?{file_ext_pattern}[\"']?\s*\)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(file_ext_pattern, "", cleaned, flags=re.IGNORECASE)
+
+        # Remove generic document ID patterns e.g. DOC-001, DOC_123, Document ID: 123
+        cleaned = re.sub(
+            r"\b(?:(?:as\s+per|in|according\s+to|refer\s+to|reference)\s+)?(?:document|doc|report)\s+(?:ID\s*)?#?[A-Za-z0-9_-]+\b",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\b(?:document|doc|record|file)\s+ID:?\s*[A-Za-z0-9_-]+\b",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        # 5. Remove page numbers e.g. "on Page 3", "Page 2", "(p. 14)", "pages 4-5", "(Pages 2–3)"
+        cleaned = re.sub(
+            r"\b(?:on\s+|at\s+|from\s+)?(?:pages?|pgs?|p\.)\s*[0-9]+(?:\s*(?:-|–|—|to)\s*[0-9]+)?\b",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\(\s*(?:pages?|pgs?|p\.)\s*[0-9]+(?:\s*(?:-|–|—|to)\s*[0-9]+)?\s*\)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        # 6. Locate beginning of email (Subject: or Dear <recipient>,) and strip conversational preambles
+        email_start_match = re.search(
+            r"(?:\A|\n)\s*(Subject:\s*[^\n]+|Dear\s+[^,\n]+,|To:\s*[^\n]+)",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if email_start_match:
+            cleaned = cleaned[email_start_match.start():].lstrip()
+
+        # 7. Locate end of email (Sign-off) and strip conversational postambles
+        signoff_match = re.search(
+            r"(?:\n\s*(?:Best regards|Warm regards|Kind regards|With regards|Regards|Sincerely|Yours sincerely|Yours faithfully|Respectfully|Thank you|Thanks),?\s*\n[^\n]+(?:\n[^\n]+)?)",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if signoff_match:
+            cleaned = cleaned[:signoff_match.end()].rstrip()
+
+        # 8. Clean up empty parentheses, orphaned punctuation, and whitespace
+        cleaned = re.sub(r"\(\s*\)", "", cleaned)
+        cleaned = re.sub(r"\s+([,\.:;\?!])", r"\1", cleaned)
+        cleaned = re.sub(r"\b(?:as per|according to|as documented in|refer to|in)\s*[,.]", ".", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"^\s*[-*•]\s*$", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
     def format_with_provenance(
         answer_text: str,
         citations: Sequence[CitationBundle],

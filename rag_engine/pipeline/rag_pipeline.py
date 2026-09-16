@@ -171,6 +171,28 @@ class RAGResponse:
 
     def format_clean_cli_output(self) -> str:
         """Render clean, concise CLI response without debug headers."""
+        from rag_engine.generation.prompt.prompt_templates import PromptArchetype, detect_task_type
+        from rag_engine.generation.prompt.task_intent import OutputFormat, TaskClassifier
+
+        is_email = (
+            detect_task_type(self.query) == PromptArchetype.EMAIL
+            or TaskClassifier.classify(self.query).output_format == OutputFormat.EMAIL
+            or self.answer.strip().lower().startswith("subject:")
+        )
+
+        if is_email:
+            clean_ans = ResponseFormatter.sanitize_email_output(self.answer, document_names=self.sources)
+            parts = [clean_ans]
+            if self.artifact:
+                parts.append(
+                    f"\n[Generated Artifact]\n"
+                    f"  - Type: {self.artifact.artifact_type.upper()}\n"
+                    f"  - File: {self.artifact.filename}\n"
+                    f"  - Size: {self.artifact.file_size_bytes} bytes\n"
+                    f"  - Path: {self.artifact.file_path}"
+                )
+            return "\n".join(parts)
+
         clean_ans = ResponseFormatter.deduplicate_lines_and_blocks(
             ResponseFormatter.strip_provenance(self.answer)
         )
@@ -216,9 +238,12 @@ class RAGResponse:
             PromptArchetype.GENERAL_QA: "GENERATED ANSWER",
         }
 
-        clean_ans = ResponseFormatter.deduplicate_lines_and_blocks(
-            ResponseFormatter.strip_provenance(self.answer)
-        )
+        if detected == PromptArchetype.EMAIL:
+            clean_ans = ResponseFormatter.sanitize_email_output(self.answer, document_names=self.sources)
+        else:
+            clean_ans = ResponseFormatter.deduplicate_lines_and_blocks(
+                ResponseFormatter.strip_provenance(self.answer)
+            )
         if "insufficient information" in clean_ans.lower() or "insufficient evidence" in clean_ans.lower() or not self.is_grounded:
             section_title = "GENERATED RESULT"
         else:
@@ -543,14 +568,14 @@ class RAGPipeline:
         errors: list[str] = []
         for path in referenced_paths:
             try:
-                is_visual = str(path).lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg", ".dwg"))
+                is_visual = path.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".svg", ".dwg"))
                 result = inspector.inspect(path, question=intent.raw_query, use_vlm=is_visual)
                 extracted = "\n".join(p for p in [result.get("text", ""), result.get("summary", ""), (result.get("vlm") or {}).get("answer", "")] if p).strip()
                 if result.get("status") == "error" or not extracted:
                     errors.append(f"No usable visual evidence was extracted from {path}.")
                     continue
-                name = result.get("filename", str(path).replace("\\", "/").split("/")[-1])
-                chunk = Chunk.create(document_id=f"visual:{name}", content=extracted, chunk_index=0, document_name=name, source_path=result.get("path", str(path)), section_title="Vision and OCR extraction", equipment_entities=list(intent.explicit_entities), image_reference=result.get("path", str(path)))
+                name = result.get("filename", path.replace("\\", "/").split("/")[-1])
+                chunk = Chunk.create(document_id=f"visual:{name}", content=extracted, chunk_index=0, document_name=name, source_path=result.get("path", path), section_title="Vision and OCR extraction", equipment_entities=list(intent.explicit_entities), image_reference=result.get("path", path))
                 candidate = ScoredRetrievalChunk(chunk=chunk, score=1.0, rank=len(candidates), explainability="explicit requested source processed by VisionInspectorTool")
                 citation = CitationBundle(citation_id=f"[V{len(citations) + 1}]", document_id=chunk.metadata.document_id, document_name=name, source_path=chunk.metadata.source_path, page_number=None, section_title=chunk.metadata.section_title, chunk_id=chunk.chunk_id, verbatim_quote=extracted, score=1.0, equipment_tags=list(intent.explicit_entities), sha256=chunk.metadata.sha256)
                 candidates.append(candidate)
@@ -804,6 +829,101 @@ class RAGPipeline:
                 execution_trace=trace,
             )
 
+        # 0B. Deterministic Calculation Route: bypass document text retrieval and LLM hallucination
+        if decision.capability == Capability.CALCULATION:
+            from agent.tool_executor import get_tool_executor
+            executor = get_tool_executor(rag_pipeline=self)
+            cleaned_expr = re.sub(
+                r"^(?:calculate|compute|eval|evaluate|verify\s+calculation|check\s+calculation|what\s+is)\s*:?\s*",
+                "",
+                question,
+                flags=re.IGNORECASE,
+            ).strip()
+            cleaned_expr = re.sub(r"[?.!]+$", "", cleaned_expr).strip() or question
+            tool_result = executor.execute("calculator", task=question, expression=cleaned_expr)
+            total_ms = (time.perf_counter() - start_total) * 1000.0
+
+            out = tool_result.output or {}
+            res_val = out.get("formatted_result", out.get("result", ""))
+            expr = out.get("expression", question)
+            steps = out.get("steps", [])
+            steps_text = "\n".join(f"- {s.strip()}" for s in steps) if steps else ""
+            answer_text = f"**Calculation Result:** `{res_val}`\n\n**Expression:** `{expr}`"
+            if steps_text:
+                answer_text += f"\n\n**Evaluation Steps:**\n{steps_text}"
+
+            from rag_engine.generation.generation_metrics import GenerationMetrics
+            from rag_engine.generation.guardrails.citation_validator import CitationValidationReport
+            from rag_engine.generation.guardrails.confidence_scorer import ConfidenceScorer
+            from rag_engine.generation.guardrails.hallucination_guard import GroundingVerificationReport
+
+            gen_resp = GenerationResponse(
+                session_id=session_id,
+                query=question,
+                answer=answer_text,
+                raw_answer=answer_text,
+                prompt_payload=None,
+                citations=[],
+                citation_report=CitationValidationReport(
+                    cleaned_text=answer_text,
+                    total_citations_found=0,
+                    valid_citations=[],
+                    phantom_citations=[],
+                    citation_precision=1.0,
+                    is_valid=True,
+                ),
+                grounding_report=GroundingVerificationReport(
+                    grounding_score=1.0 if tool_result.is_verified else 0.0,
+                    verified_entities=[],
+                    unverified_entities=[],
+                    is_grounded=tool_result.is_verified,
+                ),
+                confidence=ConfidenceScorer().calculate(
+                    retrieval_confidence=1.0 if tool_result.is_verified else 0.0,
+                    citation_precision=1.0,
+                    grounding_score=1.0 if tool_result.is_verified else 0.0,
+                ),
+                metrics=GenerationMetrics(
+                    session_id=session_id,
+                    query=question,
+                    model_name="SafeCalculator",
+                    prompt_tokens=0,
+                    generated_tokens=0,
+                ),
+            )
+
+            trace = RAGExecutionTrace(
+                question=question,
+                embedding_model="none",
+                embedding_time_ms=0.0,
+                dense_retrieval_time_ms=0.0,
+                bm25_time_ms=0.0,
+                fusion_time_ms=0.0,
+                reranking_time_ms=0.0,
+                context_packing_time_ms=0.0,
+                prompt_tokens=0,
+                generation_time_ms=round(total_ms, 2),
+                retrieved_chunks=0,
+                confidence=1.0 if tool_result.is_verified else 0.0,
+                total_latency_ms=round(total_ms, 2),
+                model_used="SafeCalculator",
+            )
+
+            return RAGResponse(
+                query=question,
+                answer=answer_text,
+                session_id=session_id,
+                citations=[],
+                retrieval_result=RetrievalResult(query=question, candidates=[], citations=[]),
+                generation_response=gen_resp,
+                confidence_score=1.0 if tool_result.is_verified else 0.0,
+                is_grounded=tool_result.is_verified,
+                total_latency_ms=round(total_ms, 2),
+                model_used="SafeCalculator",
+                artifact=None,
+                execution_trace=trace,
+            )
+
         # 1. Retrieval Phase (Milestone 8)
         retrieval_start = time.perf_counter()
         retrieval_result = self.retrieval.retrieve(
@@ -971,8 +1091,13 @@ class RAGPipeline:
         # represented as document findings.
         if intent.output_format.value == "email":
             preserved = self._preserve_user_email_points(generation_response.answer, intent)
-            if preserved != generation_response.answer:
-                generation_response = replace(generation_response, answer=preserved, raw_answer=preserved)
+            doc_names = [
+                c.document_name for c in filtered_result.citations if getattr(c, "document_name", None)
+            ] + [
+                c.document_id for c in filtered_result.citations if getattr(c, "document_id", None)
+            ]
+            sanitized = ResponseFormatter.sanitize_email_output(preserved, document_names=doc_names)
+            generation_response = replace(generation_response, answer=sanitized, raw_answer=sanitized)
         generation_ms = (time.perf_counter() - generation_start) * 1000.0
 
         # Physical artifact creation when requested
@@ -1044,7 +1169,7 @@ class RAGPipeline:
         # invariants.  Use the canonical answer path when free-form user
         # requirements exist rather than bypassing it with raw token streaming.
         intent = TaskClassifier.classify(query)
-        if intent.user_requirements:
+        if intent.user_requirements or intent.output_format.value == "email":
             response = self.answer(
                 question=query, session_id=session_id, archetype=archetype, top_k=top_k,
             )

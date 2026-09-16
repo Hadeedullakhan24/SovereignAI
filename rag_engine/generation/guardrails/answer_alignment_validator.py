@@ -173,6 +173,13 @@ class AnswerAlignmentValidator:
                     cleaned = confirm_pat.sub(r"Key requirements include: \1.", cleaned)
                     changes.append("Sanitized unrequested confirmation requirement")
 
+            # 4. Clean citations, document IDs, page numbers, and provenance leaks from email body
+            from rag_engine.generation.response_formatter import ResponseFormatter
+            email_cleaned = ResponseFormatter.sanitize_email_output(cleaned)
+            if email_cleaned != cleaned:
+                cleaned = email_cleaned
+                changes.append("Sanitized citations, document IDs, page numbers, and provenance from email body")
+
         return cleaned, changes
 
     def evaluate(

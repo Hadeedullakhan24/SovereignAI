@@ -109,8 +109,9 @@ class PromptBuilder(BasePromptBuilder):
                 "MANDATORY EMAIL CONSTRAINTS:\n"
                 f"- Salutation: Dear {salutation_target},\n"
                 "- Write a complete, polished email with 'Subject:', salutation, structured body, and sign-off ('Best regards,').\n"
-                "- Do NOT include inline bracket citations like [1] or [2] inside the email text. State the verified facts naturally.\n"
-                "- Do NOT insert a References or Sources section inside the email.\n"
+                "- Output ONLY the email itself. Do NOT include conversational preambles or postambles.\n"
+                "- Do NOT include inline bracket citations like [1] or [2], document IDs (filenames), page numbers, or retrieved-chunk text inside the email text. State the verified facts naturally.\n"
+                "- Do NOT insert a References, Sources, or Provenance section inside the email.\n"
                 "- Do NOT claim files are attached.\n\n"
                 "ASSISTANT: "
             )

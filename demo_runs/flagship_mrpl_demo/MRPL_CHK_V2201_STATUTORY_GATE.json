@@ -1,0 +1,12 @@
+{
+  "checkpoint_id": "MRPL_CHK_V2201_STATUTORY_GATE",
+  "status": "HUMAN_APPROVAL_REQUIRED",
+  "timestamp": "2026-09-16T00:00:31Z",
+  "equipment_id": "V-2201",
+  "calculated_t_min": 5.399845718693752,
+  "measured_min_shell": 11.2,
+  "safety_margin": 5.800154281306248,
+  "authorized_budget": 315077.7,
+  "deliverable": "V-2201_Statutory_Approval_Note.docx",
+  "approval_signoff": null
+}

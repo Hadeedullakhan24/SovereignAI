@@ -95,6 +95,11 @@ class AgentResponse:
     execution_trace: str = ""                   # "Step 1 -> ... -> COMPLETED"
     reasoning_steps: List[Dict[str, Any]] = field(default_factory=list)
 
+    # -- Direct content & artifacts -------------------------------------------
+    answer: Optional[str] = None
+    citations: List[Any] = field(default_factory=list)
+    artifact: Optional[Dict[str, Any]] = None
+
     # -- Pause / resume support -----------------------------------------------
     checkpoint_id: Optional[str] = None
     checkpoint_path: Optional[str] = None
@@ -119,8 +124,74 @@ class AgentResponse:
     def is_failed(self) -> bool:
         return self.status == "failed"
 
+    def get_answer(self) -> str:
+        """Extract user-facing textual answer from answer or output payload."""
+        if self.answer is not None and str(self.answer).strip():
+            return str(self.answer).strip()
+        if isinstance(self.output, str) and self.output.strip():
+            return self.output.strip()
+        if isinstance(self.output, dict):
+            for k in ("answer", "formatted_result", "text", "summary", "result_summary", "email"):
+                v = self.output.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            ctx = self.output.get("context_state")
+            if isinstance(ctx, dict):
+                for k in ("approval_note", "sop_answer"):
+                    v = ctx.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+        if self.halt_reason:
+            return self.halt_reason
+        if self.error:
+            return f"Execution error: {self.error}"
+        if self.execution_trace:
+            return self.execution_trace
+        return ""
+
+    def get_artifact(self) -> Optional[Dict[str, Any]]:
+        """Extract verified artifact metadata if one was generated."""
+        if self.artifact and isinstance(self.artifact, dict):
+            return self.artifact
+        if isinstance(self.output, dict):
+            if "artifact" in self.output and isinstance(self.output["artifact"], dict):
+                return self.output["artifact"]
+            if "filename" in self.output and ("path" in self.output or "file_size_bytes" in self.output):
+                fname = self.output["filename"]
+                ext = Path(fname).suffix.lower().lstrip(".")
+                return {
+                    "artifact_type": ext.upper() if ext else "FILE",
+                    "filename": fname,
+                    "file_path": str(self.output.get("path") or ""),
+                    "file_size_bytes": int(self.output.get("file_size_bytes") or 0),
+                    "status": "verified" if self.is_verified else "generated",
+                    "metadata": self.output.get("metadata", {}),
+                }
+            ctx = self.output.get("context_state")
+            if isinstance(ctx, dict):
+                doc_res = ctx.get("document_result")
+                if isinstance(doc_res, dict) and "filename" in doc_res:
+                    fname = doc_res["filename"]
+                    ext = Path(fname).suffix.lower().lstrip(".")
+                    return {
+                        "artifact_type": ext.upper() if ext else "FILE",
+                        "filename": fname,
+                        "file_path": str(doc_res.get("path") or ""),
+                        "file_size_bytes": int(doc_res.get("file_size_bytes") or 0),
+                        "status": "verified" if self.is_verified else "generated",
+                        "metadata": doc_res.get("metadata", {}),
+                    }
+        return None
+
     def to_dict(self) -> Dict[str, Any]:
         """Return a fully JSON-serialisable representation."""
+        ans = self.get_answer()
+        art = self.get_artifact()
+        cits = self.citations or (
+            self.output.get("citations", [])
+            if isinstance(self.output, dict) and isinstance(self.output.get("citations"), list)
+            else []
+        )
         return {
             "status": self.status,
             "requires_approval": self.requires_approval,
@@ -135,6 +206,9 @@ class AgentResponse:
             "total_time_ms": round(self.total_time_ms, 2),
             "error": self.error,
             "model_registry_status": self.model_registry_status,
+            "answer": ans,
+            "citations": _safe_serialise(cits),
+            "artifact": _safe_serialise(art),
         }
 
 
@@ -202,14 +276,31 @@ def _plan_to_response(
         PlanStatus.HUMAN_APPROVAL_REQUIRED,
         PlanStatus.REQUIRES_HUMAN_REVIEW,
     )
-    # Aggregate: False if ANY step came back unverified
     is_verified = all(s.is_verified for s in result.steps)
+
+    ctx = result.context_state or {}
+    answer = ctx.get("approval_note") or ctx.get("sop_answer") or result.halt_reason or result.execution_trace
+    artifact = None
+    doc_out = ctx.get("document_result")
+    if isinstance(doc_out, dict) and "filename" in doc_out:
+        fname = doc_out["filename"]
+        ext = Path(fname).suffix.lower().lstrip(".")
+        artifact = {
+            "artifact_type": ext.upper() if ext else "DOCX",
+            "filename": fname,
+            "file_path": str(doc_out.get("path") or ""),
+            "file_size_bytes": int(doc_out.get("file_size_bytes") or 0),
+            "status": "verified" if is_verified else "generated",
+            "metadata": doc_out.get("metadata", {}),
+        }
 
     return AgentResponse(
         status=status,
         requires_approval=requires_approval,
         is_verified=is_verified,
         output=result.to_dict(),
+        answer=answer,
+        artifact=artifact,
         execution_trace=result.execution_trace,
         reasoning_steps=[s.to_dict() for s in result.steps],
         checkpoint_id=result.checkpoint_id,
@@ -299,116 +390,385 @@ class SovereignAgent:
     # Public API
     # =========================================================================
 
+    def _extract_math_expression(self, text: str) -> str:
+        """Strip conversational prefixes and trailing punctuation to extract math formula."""
+        cleaned = re.sub(
+            r"^(?:calculate|compute|eval|evaluate|verify\s+calculation|check\s+calculation|what\s+is)\s*:?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(r"[?.!]+$", "", cleaned).strip()
+        return cleaned
+
     def handle(self, user_request: str, **kwargs: Any) -> AgentResponse:
         """Start a new Sovereign AI workflow.
 
-        Parameters
-        ----------
-        user_request : Free-text goal from the user / Backend caller.
-        **kwargs     : Forwarded to AgentPlanner.run():
-                       - report_filename (str)         -- custom sandbox filename
-                       - force_ungrounded_calc (bool)  -- force safety-gate demo
-                       - max_steps (int)               -- cap on ReAct iterations
-                       - vision_file_path (str)        -- explicit image/PDF path
-                         (also auto-detected from user_request text).
-
-        Returns
-        -------
-        AgentResponse
-            Always returned -- never raises.  Check ``.status`` and
-            ``.requires_approval`` to determine the next action.
-
-        Safety Guarantees (inherited from AgentPlanner)
-        -----------------------------------------------
-        - Missing critical extraction fields (equipment_id, design_pressure,
-          shell_min_thickness) halt at Step 2 with status="requires_verification"
-          -- no fabricated defaults propagate downstream.
-        - Any ToolResult with is_verified=False immediately halts execution.
-        - The human-approval gate at Step 7 returns status="awaiting_approval"
-          with a checkpoint_id the caller passes back to resume().
-
-        Vision Fast-Path
-        ----------------
-        If user_request contains a file path with an image or scanned-document
-        extension (.jpg, .jpeg, .png, .pdf, .tiff, .bmp, .webp, .svg) — or if
-        ``vision_file_path`` is supplied explicitly — the request is short-
-        circuited to ``ToolExecutor.execute('vision_inspector')`` directly,
-        bypassing the 7-step inspection plan.  The response ``output`` dict
-        contains::
-
-            {
-              "file_path"       : str   -- resolved path used,
-              "routing_decision": str   -- e.g. 'plain_document' / 'engineering_drawing',
-              "text"            : str   -- raw OCR / extracted text,
-              "key_value_fields": list  -- structured key-value pairs,
-              "equipment_list"  : list  -- equipment tags found,
-              "tables"          : list,
-              "summary"         : dict,
-              "question"        : str | None,
-              "execution_time_ms": float,
-            }
+        Routes requests dynamically through CentralIntentClassifier and TaskRouter
+        to the appropriate local offline capability:
+        - Image generation (Stable Diffusion)
+        - Vision inspection (OCR / VLM)
+        - Document generation (PDF, DOCX, XLSX, PPTX)
+        - Mathematical calculation (AST SafeCalculator)
+        - Sandboxed Python execution
+        - Multi-step inspection review (AgentPlanner ReAct workflow)
+        - Document-grounded Q&A (RAGPipeline)
         """
         t0 = time.perf_counter()
         registry_snap = self._registry_snapshot()
-        # ── Router Dispatch ─────────────────────────────────────────────────
-        # Determine capability, archetype, and designated execution tool.
+
+        # ── 1. Authoritative Intent Classification & Task Routing ──────────
+        from agent.intent import ActionType, CentralIntentClassifier, OutputModality
+        intent = CentralIntentClassifier.classify(user_request, **kwargs)
         decision: RoutingDecision = self.router.route(user_request)
 
-        # ── Image Generation Direct Route ───────────────────────────────────
-        # Route generative text-to-image synthesis requests directly to
-        # ToolExecutor.execute("image_generator", ...) bypassing the document planner.
-        if decision.capability == Capability.IMAGE_GENERATION or decision.tool_name == "image_generator":
+        # ── 2. Image Generation ─────────────────────────────────────────────
+        if decision.capability == Capability.IMAGE_GENERATION or intent.is_image_generation or decision.tool_name == "image_generator":
             return self._handle_image_generation(user_request, decision, t0, registry_snap, **kwargs)
 
-        # ── Vision Fast-Path ────────────────────────────────────────────────
-        # Detect image/PDF paths in the request and short-circuit to the
-        # vision tool, bypassing the 7-step document-inspection planner which
-        # has no mechanism to pick up image paths from free-text goals.
-        vision_file_path: Optional[str] = (
-            kwargs.pop("vision_file_path", None)
-            or _extract_image_path(user_request)
+        # ── 3. Vision Fast-Path / Inspection ────────────────────────────────
+        # Only route to vision inspector if the intent actually requests visual analysis
+        # or if an explicit vision parameter/use_vlm flag was supplied.
+        # Queries requesting document Q&A (e.g. "What safety precautions are mentioned in OISD_Standard_105.pdf?")
+        # must remain on the RAG path and NOT trigger vision inspection merely because ".pdf" is present.
+        vision_file_path: Optional[str] = kwargs.pop("vision_file_path", None)
+        if not vision_file_path:
+            vision_file_path = _extract_image_path(user_request)
+        is_explicit_vision = bool(
+            kwargs.get("use_vlm")
+            or intent.is_existing_visual_analysis
+            or intent.action == ActionType.ANALYZE_EXISTING
+            or (decision.capability == Capability.VISION and decision.tool_name == "vision_inspector")
         )
-        if vision_file_path:
-            # An email that names an image/P&ID must not terminate at the
-            # inspection fast-path: send the extracted source through the
-            # canonical RAG/evidence/email path instead.
+
+        if is_explicit_vision and vision_file_path:
             from rag_engine.generation.prompt.task_intent import OutputFormat, TaskClassifier
             email_intent = TaskClassifier.classify(user_request)
             if email_intent.output_format == OutputFormat.EMAIL:
-                return self._handle_grounded_email(
-                    user_request, vision_file_path, t0, registry_snap, **kwargs
-                )
+                return self._handle_grounded_email(user_request, vision_file_path, t0, registry_snap, **kwargs)
             return self._handle_vision(user_request, vision_file_path, t0, registry_snap, **kwargs)
 
-        # ── Standard 7-step planner path ────────────────────────────────────
+        # ── 4. Document Artifact Generation (PDF, DOCX, XLSX, PPTX) ────────
+        if decision.capability == Capability.DOCUMENT_GENERATION or intent.output_modality == OutputModality.DOCUMENT_FILE:
+            return self._handle_document_generation(user_request, decision, t0, registry_snap, **kwargs)
+
+        # ── 5. Deterministic Engineering Calculation ────────────────────────
+        if decision.capability == Capability.CALCULATION or intent.action == ActionType.CALCULATE:
+            return self._handle_calculation(user_request, decision, t0, registry_snap, **kwargs)
+
+        # ── 6. Sandboxed Code Execution ─────────────────────────────────────
+        if decision.capability == Capability.CODING or intent.action == ActionType.WRITE_CODE:
+            return self._handle_coding(user_request, decision, t0, registry_snap, **kwargs)
+
+        # ── 7. Multi-Step Inspection Report Workflow (AgentPlanner) ─────────
+        is_inspection_workflow = bool(
+            kwargs.get("report_filename")
+            or re.search(r"\b(?:inspection\s+report|v-2201|knockout\s+drum|statutory\s+compliance\s+review|compliance\s+plan|re-act\s+plan|approval\s+note\s+for)\b", user_request, re.IGNORECASE)
+        )
+        if is_inspection_workflow:
+            try:
+                max_steps = int(kwargs.pop("max_steps", 10))
+                result: PlanExecutionResult = self.planner.run(
+                    user_goal=user_request,
+                    max_steps=max_steps,
+                    **kwargs,
+                )
+            except Exception as exc:
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                logger.error("SovereignAgent.handle planner exception: %s", exc, exc_info=True)
+                return AgentResponse(
+                    status="failed",
+                    error=str(exc),
+                    answer=f"Planner execution failed: {exc}",
+                    total_time_ms=elapsed,
+                    model_registry_status=registry_snap,
+                )
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            return _plan_to_response(result, elapsed, registry_snap)
+
+        # ── 8. RAG / Knowledge Base Document Q&A (Default) ─────────────────
+        return self._handle_rag(user_request, decision, t0, registry_snap, **kwargs)
+
+    def _handle_calculation(
+        self,
+        user_request: str,
+        decision: RoutingDecision,
+        t0: float,
+        registry_snap: Dict[str, Any],
+        **kwargs: Any,
+    ) -> AgentResponse:
+        """Deterministic mathematical calculation via AST SafeCalculator."""
+        expr = kwargs.pop("expression", None) or self._extract_math_expression(user_request)
+        variables = kwargs.pop("variables", {})
+        force_ungrounded = kwargs.pop("force_ungrounded", False)
+
         try:
-            max_steps = int(kwargs.pop("max_steps", 10))
-            result: PlanExecutionResult = self.planner.run(
-                user_goal=user_request,
-                max_steps=max_steps,
+            tool_result = self.tool_executor.execute(
+                "calculator",
+                expression=expr,
+                variables=variables,
+                task=user_request,
+                force_ungrounded=force_ungrounded,
                 **kwargs,
             )
         except Exception as exc:
             elapsed = (time.perf_counter() - t0) * 1000.0
-            logger.error(
-                "SovereignAgent.handle unhandled exception: %s", exc, exc_info=True
-            )
             return AgentResponse(
                 status="failed",
                 error=str(exc),
+                answer=f"Calculation error: {exc}",
                 total_time_ms=elapsed,
                 model_registry_status=registry_snap,
             )
 
         elapsed = (time.perf_counter() - t0) * 1000.0
-        response = _plan_to_response(result, elapsed, registry_snap)
-        logger.info(
-            "SovereignAgent.handle done | status=%s | time=%.1fms | checkpoint=%s",
-            response.status,
-            response.total_time_ms,
-            response.checkpoint_id,
+        out = tool_result.output or {}
+        if tool_result.status == "success":
+            agent_status = "completed"
+            steps = out.get("steps", [])
+            steps_text = "\n".join(f"- {s.strip()}" for s in steps) if steps else ""
+            res_val = out.get("formatted_result", out.get("result", ""))
+            answer = f"**Calculation Result:** `{res_val}`\n\n**Expression:** `{out.get('expression', expr)}`"
+            if steps_text:
+                answer += f"\n\n**Evaluation Steps:**\n{steps_text}"
+        else:
+            agent_status = "requires_verification" if tool_result.status == "requires_verification" else "failed"
+            answer = f"Calculation requires verification: {tool_result.error or tool_result.status}"
+
+        return AgentResponse(
+            status=agent_status,
+            requires_approval=False,
+            is_verified=tool_result.is_verified,
+            output=out,
+            answer=answer,
+            execution_trace=f"SafeCalculator: {expr} = {out.get('formatted_result', out.get('result', 'error'))}",
+            reasoning_steps=[{
+                "step_number": 1,
+                "name": "Deterministic AST Calculation",
+                "step_type": "automated",
+                "action": f"calculator(expression={expr!r})",
+                "observation": f"Result: {out.get('result')} | Steps: {len(out.get('steps', []))}",
+                "status": tool_result.status,
+                "is_verified": tool_result.is_verified,
+                "execution_time_ms": round(tool_result.execution_time_ms, 2),
+            }],
+            error=tool_result.error,
+            total_time_ms=elapsed,
+            model_registry_status=registry_snap,
         )
-        return response
+
+    def _handle_document_generation(
+        self,
+        user_request: str,
+        decision: RoutingDecision,
+        t0: float,
+        registry_snap: Dict[str, Any],
+        **kwargs: Any,
+    ) -> AgentResponse:
+        """Grounded document artifact generation (PDF, DOCX, XLSX, PPTX)."""
+        tool_name = decision.tool_name or "pdf_generator"
+        ext_map = {
+            "pdf_generator": "pdf",
+            "document_generator": "docx",
+            "xlsx_generator": "xlsx",
+            "pptx_generator": "pptx",
+        }
+        default_ext = ext_map.get(tool_name, "pdf")
+
+        # Extract filename if user specified one
+        fname = kwargs.get("filename") or kwargs.get("report_filename")
+        if not fname:
+            match = re.search(r"([\w\-]+)\.(pdf|docx|xlsx|pptx)\b", user_request, re.IGNORECASE)
+            if match:
+                fname = match.group(0)
+            else:
+                fname = f"refinery_report.{default_ext}"
+        if not fname.lower().endswith(f".{default_ext}"):
+            fname = f"{fname}.{default_ext}"
+        kwargs["filename"] = fname
+
+        try:
+            tool_result = self.tool_executor.execute(
+                decision,
+                task=user_request,
+                **kwargs,
+            )
+        except Exception as exc:
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            logger.error("Document generation error: %s", exc, exc_info=True)
+            return AgentResponse(
+                status="failed",
+                error=str(exc),
+                answer=f"Document generation failed: {exc}",
+                total_time_ms=elapsed,
+                model_registry_status=registry_snap,
+            )
+
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        out = tool_result.output or {}
+        is_ver = tool_result.is_verified and tool_result.status == "success"
+        agent_status = "completed" if is_ver else ("requires_verification" if tool_result.status == "requires_verification" else "failed")
+
+        artifact_dict = None
+        if tool_result.status == "success" and isinstance(out, dict) and "filename" in out:
+            doc_ext = Path(out["filename"]).suffix.lstrip(".").upper() or default_ext.upper()
+            artifact_dict = {
+                "artifact_type": doc_ext,
+                "filename": out["filename"],
+                "file_path": str(out.get("path") or ""),
+                "file_size_bytes": int(out.get("file_size_bytes") or 0),
+                "status": "verified" if is_ver else "generated",
+                "metadata": out.get("metadata", {}),
+            }
+
+        rag_ans = (tool_result.rag_context or {}).get("answer", "")
+        summary_text = f"Successfully generated {default_ext.upper()} deliverable: **{out.get('filename', fname)}** ({out.get('file_size_bytes', 0):,} bytes)."
+        if rag_ans:
+            summary_text += f"\n\n**Grounded Content Summary:**\n{rag_ans}"
+
+        citations = (tool_result.rag_context or {}).get("citations", [])
+        return AgentResponse(
+            status=agent_status,
+            requires_approval=False,
+            is_verified=is_ver,
+            output=out,
+            answer=summary_text,
+            citations=citations,
+            artifact=artifact_dict,
+            execution_trace=f"Document generation: {tool_name} -> {out.get('filename', fname)} [{tool_result.status}]",
+            reasoning_steps=[{
+                "step_number": 1,
+                "name": f"Generate {default_ext.upper()} Deliverable",
+                "step_type": "automated",
+                "action": f"{tool_name}(filename={fname!r})",
+                "observation": f"Created {out.get('filename', fname)} ({out.get('file_size_bytes', 0)} bytes)",
+                "status": tool_result.status,
+                "is_verified": is_ver,
+                "execution_time_ms": round(elapsed, 2),
+            }],
+            error=tool_result.error,
+            total_time_ms=elapsed,
+            model_registry_status=registry_snap,
+        )
+
+    def _handle_rag(
+        self,
+        user_request: str,
+        decision: RoutingDecision,
+        t0: float,
+        registry_snap: Dict[str, Any],
+        **kwargs: Any,
+    ) -> AgentResponse:
+        """Grounded Question Answering via local RAGPipeline."""
+        try:
+            tool_result = self.tool_executor.execute(
+                decision,
+                task=user_request,
+                **kwargs,
+            )
+        except Exception as exc:
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            logger.error("RAG execution error: %s", exc, exc_info=True)
+            return AgentResponse(
+                status="failed",
+                error=str(exc),
+                answer=f"RAG query execution failed: {exc}",
+                total_time_ms=elapsed,
+                model_registry_status=registry_snap,
+            )
+
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        rag_ctx = tool_result.rag_context or {}
+        raw_answer = tool_result.output if isinstance(tool_result.output, str) else rag_ctx.get("answer", "")
+        citations = rag_ctx.get("citations", [])
+        verified = tool_result.is_verified and tool_result.status == "success"
+
+        if tool_result.status == "success":
+            agent_status = "completed"
+        elif tool_result.status in ("insufficient_evidence", "requires_verification"):
+            agent_status = "requires_verification"
+        else:
+            agent_status = "failed"
+
+        return AgentResponse(
+            status=agent_status,
+            requires_approval=False,
+            is_verified=verified,
+            output=rag_ctx or {"answer": raw_answer, "citations": citations},
+            answer=raw_answer,
+            citations=citations,
+            artifact=None,
+            execution_trace=f"RAG Retrieval & Generation: {decision.tool_name} [{decision.archetype.value}] -> {tool_result.status}",
+            reasoning_steps=[{
+                "step_number": 1,
+                "name": f"Document Grounding [{decision.archetype.value}]",
+                "step_type": "automated",
+                "action": f"rag_search(archetype={decision.archetype.value})",
+                "observation": f"Retrieved {rag_ctx.get('retrieved_chunks', 0)} chunks | confidence={rag_ctx.get('confidence_score', 0):.2f}",
+                "status": tool_result.status,
+                "is_verified": verified,
+                "execution_time_ms": round(elapsed, 2),
+            }],
+            error=tool_result.error,
+            total_time_ms=elapsed,
+            model_registry_status=registry_snap,
+        )
+
+    def _handle_coding(
+        self,
+        user_request: str,
+        decision: RoutingDecision,
+        t0: float,
+        registry_snap: Dict[str, Any],
+        **kwargs: Any,
+    ) -> AgentResponse:
+        """Sandboxed code interpreter / script execution."""
+        try:
+            tool_result = self.tool_executor.execute(
+                decision,
+                task=user_request,
+                **kwargs,
+            )
+        except Exception as exc:
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            return AgentResponse(
+                status="failed",
+                error=str(exc),
+                answer=f"Coding tool failed: {exc}",
+                total_time_ms=elapsed,
+                model_registry_status=registry_snap,
+            )
+
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        out = tool_result.output or {}
+        if tool_result.status == "success":
+            ans = f"**Code Execution Output:**\n```\n{out.get('stdout', '')}\n```"
+            status = "completed"
+        else:
+            ans = f"**Code Execution ({tool_result.status}):**\n{tool_result.error or out.get('stderr', '')}"
+            status = "failed"
+
+        return AgentResponse(
+            status=status,
+            requires_approval=False,
+            is_verified=tool_result.is_verified,
+            output=out,
+            answer=ans,
+            execution_trace=f"Code Interpreter -> {tool_result.status}",
+            reasoning_steps=[{
+                "step_number": 1,
+                "name": "Sandboxed Python Execution",
+                "step_type": "automated",
+                "action": "code_interpreter()",
+                "observation": str(out.get("stdout", ""))[:200],
+                "status": tool_result.status,
+                "is_verified": tool_result.is_verified,
+                "execution_time_ms": round(elapsed, 2),
+            }],
+            error=tool_result.error,
+            total_time_ms=elapsed,
+            model_registry_status=registry_snap,
+        )
 
     def _handle_grounded_email(
         self,

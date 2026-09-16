@@ -65,21 +65,27 @@ class TransactionManager:
         self,
         store: BaseVectorStore,
         journal_dir: Path = Path("vector_db/journal"),
+        enabled: bool = True,
     ) -> None:
         self.store = store
         self.journal_dir = journal_dir
         self.journal_file = journal_dir / "wal.jsonl"
+        self.enabled = enabled
         self._lock = threading.RLock()
         self._active_txs: dict[str, TransactionRecord] = {}
         self._ensure_journal()
 
     def _ensure_journal(self) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self.journal_dir.mkdir(parents=True, exist_ok=True)
             if not self.journal_file.exists():
                 self.journal_file.touch()
 
     def _append_log(self, record: TransactionRecord) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             with open(self.journal_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record.to_dict()) + "\n")

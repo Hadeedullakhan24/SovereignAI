@@ -1,0 +1,41 @@
+services:
+  api:
+    build: { context: ., dockerfile: backend/Dockerfile }
+    environment:
+      SOVEREIGNAI_DATABASE_URL: postgresql+psycopg://sovereignai:sovereignai@postgres:5432/sovereignai
+      SOVEREIGNAI_REDIS_URL: redis://redis:6379/0
+      SOVEREIGNAI_JWT_SECRET: ${SOVEREIGNAI_JWT_SECRET:?set a 32+ character secret}
+      SOVEREIGNAI_ENVIRONMENT: production
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  worker:
+    build: { context: ., dockerfile: backend/Dockerfile }
+    command: celery -A backend.app.workers.celery_app.celery_app worker --loglevel=INFO
+    environment:
+      SOVEREIGNAI_DATABASE_URL: postgresql+psycopg://sovereignai:sovereignai@postgres:5432/sovereignai
+      SOVEREIGNAI_REDIS_URL: redis://redis:6379/0
+      SOVEREIGNAI_JWT_SECRET: ${SOVEREIGNAI_JWT_SECRET:?set a 32+ character secret}
+      SOVEREIGNAI_ENVIRONMENT: production
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  migrate:
+    build: { context: ., dockerfile: backend/Dockerfile }
+    command: alembic -c backend/alembic.ini upgrade head
+    environment:
+      SOVEREIGNAI_DATABASE_URL: postgresql+psycopg://sovereignai:sovereignai@postgres:5432/sovereignai
+      SOVEREIGNAI_REDIS_URL: redis://redis:6379/0
+      SOVEREIGNAI_JWT_SECRET: ${SOVEREIGNAI_JWT_SECRET:?set a 32+ character secret}
+      SOVEREIGNAI_ENVIRONMENT: production
+    depends_on: { postgres: { condition: service_healthy } }
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: sovereignai, POSTGRES_USER: sovereignai, POSTGRES_PASSWORD: sovereignai }
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U sovereignai -d sovereignai"], interval: 5s, timeout: 3s, retries: 20 }
+  redis:
+    image: redis:7-alpine
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 20 }
+volumes: { postgres_data: {} }

@@ -19,7 +19,8 @@ class EvidenceRelation(str, Enum):
 
 _STOP = frozenset(
     "a an the and or of for to in on with from by is are was were what which who when where "
-    "does do did show tell give list create generate report document available evidence actual "
+    "does do did show tell give list create generate report document documents documentation "
+    "docx pdf xlsx pptx available evidence actual "
     "prepare export produce build make draft write download artifact file format using use "
     "containing contain only based provide according".split()
 )
@@ -412,9 +413,9 @@ class EvidenceSelector:
         has_generic = any(i.relation is EvidenceRelation.GENERIC_REQUIREMENT for i in items)
 
         # For an artifact generation request without explicit entity: if no direct/related findings exist
-        # and only scattered generic documents are found, reject scope creation to prevent hallucinated reports.
+        # and no matching generic standards/requirements exist, reject scope creation to prevent hallucinated reports.
         is_scope_ok = True
-        if is_artifact_request and not requested and not has_direct_or_related:
+        if is_artifact_request and not requested and not has_direct_or_related and not has_generic:
             is_scope_ok = False
 
         # If the request named a file, successful evidence selection requires

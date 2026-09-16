@@ -36,6 +36,7 @@ import pytest
 
 from rag_engine.chunking import get_chunk_factory
 from rag_engine.embeddings.embedding_pipeline import EmbeddingPipeline
+from rag_engine.generation.generation_config import GenerationConfig
 from rag_engine.generation.generation_pipeline import GenerationPipeline
 from rag_engine.generation.prompt import PromptArchetype
 from rag_engine.loaders import LoaderFactory
@@ -144,8 +145,13 @@ def test_complete_rag_pipeline_end_to_end(tmp_path: Path):
     query = "What is the maximum discharge pressure of centrifugal pump P-101?"
 
     # 9. Context Packing & Prompt Builder -> RetrievedPrompt
+    gen_config = GenerationConfig(
+        default_model_name="deterministic_test",
+        cache_enabled=False,
+    )
     rag_pipe = RAGPipeline(
         retrieval_pipeline=retrieval_pipe,
+        config=gen_config,
     )
 
     retrieved_prompt = rag_pipe.build_retrieved_prompt(

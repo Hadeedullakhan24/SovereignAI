@@ -59,6 +59,7 @@ from rag_engine.generation.models.base_model import BaseLocalLLM
 from rag_engine.generation.models.model_factory import LLMFactory
 from rag_engine.generation.prompt.prompt_builder import PromptBuilder, PromptPayload
 from rag_engine.generation.prompt.prompt_templates import PromptArchetype
+from rag_engine.generation.prompt.task_intent import OutputFormat, TaskClassifier
 from rag_engine.generation.response_formatter import ResponseFormatter
 from rag_engine.generation.streaming_manager import StreamingManager
 from rag_engine.retrieval.base_retriever import CitationBundle, RetrievalResult
@@ -177,7 +178,10 @@ class GenerationPipeline:
         # User-only requests carry live, non-citable requirements.  Do not
         # reuse a prior document-oriented fallback for them; their validation
         # context is intentionally different from retrieved evidence.
-        user_provided_context = "USER_PROVIDED_INFORMATION" in prompt_payload.context_window
+        user_provided_context = (
+            prompt_payload.context_window is not None
+            and "USER_PROVIDED_INFORMATION" in prompt_payload.context_window
+        )
         if self.cache is not None and self.config.cache_enabled and not user_provided_context:
             cached = self.cache.get(cache_key)
             if cached is not None:
@@ -305,16 +309,33 @@ class GenerationPipeline:
         )
         guard_ms = (time.perf_counter() - start_guard) * 1000.0
 
-        # 10. Format Response with Provenance References
+        # 10. Format Response (Email vs Provenance References)
         clean_ans = alignment_report.cleaned_text
         # A response that fails either grounding or answer/evidence alignment
         # is never formatted as a trustworthy answer or turned into an artifact.
         if not ground_report.is_grounded or not alignment_report.is_question_aligned:
             clean_ans = "Not documented in the available evidence."
-        final_answer = ResponseFormatter.format_with_provenance(
-            answer_text=clean_ans,
-            citations=retrieval_result.citations,
+
+        is_email_task = (
+            archetype == PromptArchetype.EMAIL
+            or (isinstance(archetype, str) and archetype.lower() == "email")
+            or TaskClassifier.classify(query).output_format == OutputFormat.EMAIL
         )
+        if is_email_task:
+            doc_names = [
+                c.document_name for c in retrieval_result.citations if getattr(c, "document_name", None)
+            ] + [
+                c.document_id for c in retrieval_result.citations if getattr(c, "document_id", None)
+            ]
+            final_answer = ResponseFormatter.sanitize_email_output(
+                clean_ans,
+                document_names=doc_names,
+            )
+        else:
+            final_answer = ResponseFormatter.format_with_provenance(
+                answer_text=clean_ans,
+                citations=retrieval_result.citations,
+            )
 
         # Output Safety Validation (credential redaction)
         if self.config.guardrails.enable_safety_validation:

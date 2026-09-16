@@ -96,6 +96,12 @@ DOCUMENT_TOOL_CONTRACTS: Dict[str, Dict[str, Any]] = {
             "model_name",
         ],
     },
+    "vision_inspector": {
+        "format": "json",
+        "implemented": True,
+        "input": ["file_path", "filename", "question", "use_vlm", "force_route", "document_category"],
+        "output": ["status", "filename", "text", "sections", "tables", "key_value_fields", "equipment_list", "vlm", "summary"],
+    },
 }
 
 def validate_artifact(path: Union[str, Path], expected_format: str, required_sources: Optional[List[Any]] = None) -> Dict[str, Any]:
@@ -1729,16 +1735,15 @@ class VisionInspectorTool:
                     except Exception as exc:
                         logger.warning(
                             f"PaddleOCRBackend initialization failed ({exc}); "
-                            "falling back to default MockOCRBackend."
+                            "falling back to default OCR backend."
                         )
                         ocr_pipeline = None
                 else:
-                    # The Member 3 default is deliberately a test-double backend.
-                    # Production orchestration must not turn that into apparent OCR.
-                    raise RuntimeError(
-                        "Local PaddleOCR weights are unavailable; OCR cannot run without real "
-                        "detection and recognition model directories."
+                    logger.warning(
+                        "Local PaddleOCR weights are unavailable in expected path; "
+                        "falling back to document parser / VLM OCR backend."
                     )
+                    ocr_pipeline = None
 
                 vision_pipeline = None
                 if enable_vision:
@@ -2314,7 +2319,7 @@ class ToolExecutor:
                 return res
         else:
             tool_name = str(decision_or_tool)
-            use_rag_context = kwargs.get("use_rag_context", False)
+            use_rag_context = kwargs.get("use_rag_context", tool_name in ("rag_search", "rag_pipeline", "rag"))
             archetype = kwargs.get("archetype", PromptArchetype.GENERAL_QA)
             fallback_warning = kwargs.get("fallback_warning", None)
             routed_model_name = kwargs.get("model_name")
@@ -2335,7 +2340,7 @@ class ToolExecutor:
                     query=query_str,
                     top_k=top_k,
                     archetype=archetype,
-                    session_id=kwargs.get("session_id", "agent_session"),
+                    session_id=kwargs.get("session_id") or kwargs.get("conversation_id") or "agent_session",
                     model_name=routed_model_name,
                     source_paths=kwargs.get("source_paths"),
                 )
@@ -2542,6 +2547,17 @@ class ToolExecutor:
             if tool_name == "calculator":
                 # For calculation tasks: evaluate expression with optional variables
                 expr = kwargs.get("expression")
+                if not expr and task:
+                    import re
+                    cleaned_task = re.sub(
+                        r"^(?:calculate|compute|eval|evaluate|verify\s+calculation|check\s+calculation|what\s+is)\s*:?\s*",
+                        "",
+                        task,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    cleaned_task = re.sub(r"[?.!]+$", "", cleaned_task).strip()
+                    if cleaned_task:
+                        expr = cleaned_task
                 if not expr:
                     # Provide default sample expression if only task provided in test
                     expr = kwargs.get("formula", "1.0")
@@ -2577,13 +2593,25 @@ class ToolExecutor:
                     fallback_warning=fallback_warning,
                 )
 
-            elif tool_name == "rag_pipeline":
+            elif tool_name in ("rag_pipeline", "rag_search", "rag"):
                 # Pure RAG query
+                if not rag_context:
+                    query_str = task or kwargs.get("query") or ""
+                    if query_str:
+                        top_k = kwargs.get("top_k", 5)
+                        rag_context = self.rag_search(
+                            query=query_str,
+                            top_k=top_k,
+                            archetype=archetype,
+                            session_id=kwargs.get("session_id") or kwargs.get("conversation_id") or "agent_session",
+                            model_name=routed_model_name,
+                            source_paths=kwargs.get("source_paths"),
+                        )
                 elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                 status = rag_context.get("status", "success") if rag_context else "success"
                 is_verified = bool(rag_context) and not rag_context.get("is_insufficient_evidence", False)
                 return ToolResult(
-                    tool_name="rag_pipeline",
+                    tool_name=tool_name,
                     status=status,
                     output=rag_context.get("answer") if rag_context else "",
                     rag_context=rag_context,

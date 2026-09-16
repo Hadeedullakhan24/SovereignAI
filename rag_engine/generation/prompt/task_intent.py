@@ -171,7 +171,7 @@ class TaskIntent:
                 subj = self.subject_topic or "Refinery Operations Update"
                 lines.append(f"- Subject Line: 'Subject: {subj}'")
 
-            lines.append("- Formatting: Do NOT include inline bracket citations [n], references sections, or attachment claims.")
+            lines.append("- Formatting: Output ONLY the email itself. Do NOT include References, Sources, Provenance, inline bracket citations [n], document IDs, page numbers, retrieved-chunk text, or attachment claims.")
             if self.requires_source_evidence:
                 lines.append("- SOURCE CONSTRAINT: Retrieve and use the requested source evidence before drafting; do not write a generic email.")
             if self.requires_vision_analysis:
