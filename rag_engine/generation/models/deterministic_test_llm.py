@@ -38,10 +38,16 @@ class DeterministicTestLLM(BaseLocalLLM):
         # 1. Extract question
         question = ""
         q_match = re.search(
-            r"(?:=== USER QUERY ===|Question|Query|USER QUERY)\s*:?\s*(.*?)(?:\n===|\n\n[A-Z]|\Z)",
+            r"===\s*USER QUERY\s*===\s*\n(.*?)(?=\n===|\Z)",
             prompt,
             re.DOTALL | re.IGNORECASE,
         )
+        if not q_match:
+            q_match = re.search(
+                r"(?:^|\n)(?:Question|Query|USER QUERY)\s*:\s*(.*?)(?=\n===|\n\n[A-Z]|\Z)",
+                prompt,
+                re.DOTALL | re.IGNORECASE,
+            )
         if q_match:
             question = q_match.group(1).strip()
 

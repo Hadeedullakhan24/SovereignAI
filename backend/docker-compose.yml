@@ -1,0 +1,20 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://sovereignai:sovereignai@postgres:5432/sovereignai
+    ports: ["8000:8000"]
+    volumes: ["./storage:/app/storage"]
+    depends_on: [postgres]
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sovereignai
+      POSTGRES_USER: sovereignai
+      POSTGRES_PASSWORD: sovereignai
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+volumes:
+  postgres_data:

@@ -177,7 +177,9 @@ class GenerationPipeline:
         # User-only requests carry live, non-citable requirements.  Do not
         # reuse a prior document-oriented fallback for them; their validation
         # context is intentionally different from retrieved evidence.
-        user_provided_context = "USER_PROVIDED_INFORMATION" in prompt_payload.context_window
+        user_provided_context = bool(
+            prompt_payload.context_window and "USER_PROVIDED_INFORMATION" in prompt_payload.context_window
+        )
         if self.cache is not None and self.config.cache_enabled and not user_provided_context:
             cached = self.cache.get(cache_key)
             if cached is not None:
